@@ -75,7 +75,7 @@ jobs:
         path: |
           ~/.stack
           .stack-work
-        key: ${{ runner.os }}-stack
+        key: ${{ runner.os }}-stack-bump
 
     - name: Build Futhark
       run: |
