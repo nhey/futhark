@@ -78,7 +78,6 @@ import Futhark.Util.Loc hiding (L) -- Lexer has replacements.
       constructor     { L _ (CONSTRUCTOR _) }
 
       '.field'        { L _ (PROJ_FIELD _) }
-      '.['            { L _ PROJ_INDEX }
 
       intlit          { L _ (INTLIT _) }
       i8lit           { L _ (I8LIT _) }
@@ -95,6 +94,7 @@ import Futhark.Util.Loc hiding (L) -- Lexer has replacements.
       stringlit       { L _ (STRINGLIT _) }
       charlit         { L _ (CHARLIT _) }
 
+      '.'            { L $$ DOT }
       '..'            { L $$ TWO_DOTS }
       '...'           { L $$ THREE_DOTS }
       '..<'           { L $$ TWO_DOTS_LT }
@@ -151,6 +151,7 @@ import Futhark.Util.Loc hiding (L) -- Lexer has replacements.
       '->'            { L $$ RIGHT_ARROW }
       ':'             { L $$ COLON }
       ':>'            { L $$ COLON_GT }
+      '?'             { L $$ QUESTION_MARK  }
       for             { L $$ FOR }
       do              { L $$ DO }
       with            { L $$ WITH }
@@ -430,7 +431,12 @@ TypeExp :: { UncheckedTypeExp }
            { let L _ (ID v) = $2 in TEArrow (Just v) $4 $7 (srcspan $1 $>) }
          | TypeExpTerm '->' TypeExp
            { TEArrow Nothing $1 $3 (srcspan $1 $>) }
+         | '?' TypeExpDims '.' TypeExp { TEDim $2 $4 (srcspan $1 $>) }
          | TypeExpTerm %prec typeprec { $1 }
+
+TypeExpDims :: { [Name] }
+         : '[' id ']'             { let L _ (ID v) = $2 in [v] }
+         | '[' id ']' TypeExpDims { let L _ (ID v) = $2 in v : $4 }
 
 TypeExpTerm :: { UncheckedTypeExp }
          : '*' TypeExpTerm
@@ -669,8 +675,8 @@ Atom : PrimLit        { Literal (fst $1) (snd $1) }
      | '(' FieldAccess FieldAccesses ')'
        { ProjectSection (map fst ($2:$3)) NoInfo (srcspan $1 $>) }
 
-     | '(' '.[' DimIndices ']' ')'
-       { IndexSection $3 NoInfo (srcspan $1 $>) }
+     | '(' '.' '[' DimIndices ']' ')'
+       { IndexSection $4 NoInfo (srcspan $1 $>) }
 
 
 PrimLit :: { (PrimValue, SrcLoc) }

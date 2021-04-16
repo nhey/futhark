@@ -2131,6 +2131,11 @@ typeExpForError (E.TESum cs _) = do
     onClause c = do
       c' <- mapM typeExpForError c
       return $ intercalate [" "] c'
+typeExpForError (TEDim dims t _) = do
+  t' <- typeExpForError t
+  return $ ErrorString ("?" <> concatMap onDim dims <> ".") : t'
+  where
+    onDim d = "[" <> prettyName d <> "]"
 
 dimExpForError :: E.DimExp VName -> InternaliseM (ErrorMsgPart SubExp)
 dimExpForError (DimExpNamed d _) = do

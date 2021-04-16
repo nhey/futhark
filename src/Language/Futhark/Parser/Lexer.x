@@ -79,6 +79,7 @@ tokens :-
   "}"                      { tokenC RCURLY }
   ","                      { tokenC COMMA }
   "_"                      { tokenC UNDERSCORE }
+  "?"                      { tokenC QUESTION_MARK }
   "->"                     { tokenC RIGHT_ARROW }
   ":"                      { tokenC COLON }
   ":>"                     { tokenC COLON_GT }
@@ -93,6 +94,7 @@ tokens :-
   "..>"                    { tokenC TWO_DOTS_GT }
   "..."                    { tokenC THREE_DOTS }
   ".."                     { tokenC TWO_DOTS }
+  "."                      { tokenC DOT }
 
   @intlit i8               { tokenM $ return . I8LIT . readIntegral . T.filter (/= '_') . T.takeWhile (/='i') }
   @intlit i16              { tokenM $ return . I16LIT . readIntegral . T.filter (/= '_') . T.takeWhile (/='i') }
@@ -127,7 +129,6 @@ tokens :-
   @qualbinop               { tokenM $ \s -> do (qs,k) <- mkQualId s; return (symbol qs k) }
 
   "." (@identifier|[0-9]+) { tokenM $ return . PROJ_FIELD . nameFromText . T.drop 1 }
-  "." "["                  { tokenC PROJ_INDEX }
 {
 
 keyword :: T.Text -> Token
@@ -292,7 +293,6 @@ data Token = ID Name
            | SYMBOL BinOp [Name] Name
            | CONSTRUCTOR Name
            | PROJ_FIELD Name
-           | PROJ_INDEX
 
            | INTLIT Integer
            | STRINGLIT String
@@ -317,6 +317,7 @@ data Token = ID Name
            | APOSTROPHE_THEN_TILDE
            | BACKTICK
            | HASH_LBRACKET
+           | DOT
            | TWO_DOTS
            | TWO_DOTS_LT
            | TWO_DOTS_GT
@@ -331,6 +332,7 @@ data Token = ID Name
            | COMMA
            | UNDERSCORE
            | RIGHT_ARROW
+           | QUESTION_MARK
 
            | EQU
            | ASTERISK
