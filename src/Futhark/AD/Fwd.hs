@@ -368,6 +368,10 @@ fwdSOAC _ _ VJP {} =
   error "fwdSOAC: nested VJP not allowed."
 
 fwdStm :: Stm SOACS -> ADM ()
+fwdStm (Let pat (StmAux cs attrs dec) op) | "stop_gradient" `inAttrs` attrs = do
+  -- Remove attribute so that subsequent inlining-passses apply.
+  let aux' = StmAux cs (withoutAttr "stop_gradient" attrs) dec
+  addStm $ Let pat aux' op
 fwdStm (Let pat aux (BasicOp (UpdateAcc acc i x))) = do
   pat' <- bundleNewPat pat
   x' <- bundleTangents x

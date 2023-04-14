@@ -45,6 +45,7 @@ module Futhark.IR.Syntax.Core
     Attrs (..),
     oneAttr,
     inAttrs,
+    withoutAttr,
     withoutAttrs,
     mapAttrs,
 
@@ -558,6 +559,10 @@ oneAttr = Attrs . S.singleton
 -- | Is the given attribute to be found in the attribute set?
 inAttrs :: Attr -> Attrs -> Bool
 inAttrs attr (Attrs attrs) = attr `S.member` attrs
+
+-- | Delete the given attribute from the attribute set.
+withoutAttr :: Attr -> Attrs -> Attrs
+withoutAttr attr (Attrs attrs) = Attrs $ S.delete attr attrs
 
 -- | @x `withoutAttrs` y@ gives @x@ except for any attributes also in @y@.
 withoutAttrs :: Attrs -> Attrs -> Attrs

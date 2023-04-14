@@ -1,0 +1,19 @@
+-- Test product rule.
+def f (xs: [2]f64) = (stop_gradient xs[0]) * xs[1]
+
+-- ==
+-- entry: f_jvp
+-- compiled input { [5.0, 7.0] }
+-- output { 0.0 5.0 }
+
+entry f_jvp xs =
+ (jvp f xs [1,0],
+  jvp f xs [0,1])
+
+-- ==
+-- entry: f_vjp
+-- compiled input { [5.0, 7.0] }
+-- output { [0.0, 5.0] }
+
+entry f_vjp xs =
+  vjp f xs 1

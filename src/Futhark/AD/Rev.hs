@@ -236,6 +236,12 @@ vjpOps =
     }
 
 diffStm :: Stm SOACS -> ADM () -> ADM ()
+diffStm (Let pat (StmAux cs attrs dec) op) m
+  | "stop_gradient" `inAttrs` attrs = do
+      -- Remove attribute so that subsequent inlining-passses apply.
+      let aux' = StmAux cs (withoutAttr "stop_gradient" attrs) dec
+      addStm $ Let pat aux' op
+      m
 diffStm (Let pat aux (BasicOp e)) m =
   diffBasicOp pat aux e m
 diffStm stm@(Let pat _ (Apply f args _ _)) m

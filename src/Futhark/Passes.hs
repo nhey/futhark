@@ -74,6 +74,10 @@ adPipeline =
   passes
     [ applyAD,
       simplifySOACS,
+      inlineConservatively,
+      simplifySOACS,
+      inlineAggressively,
+      simplifySOACS,
       performCSE True,
       fuseSOACs,
       performCSE True,

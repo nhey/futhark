@@ -4,6 +4,12 @@
 -- bugs.  Documentation is very sparse.  You probably don't want to
 -- use this unless you have the soul of a hero.
 
+-- | Semantically zeroes out gradients of the argument.  This can be used
+-- to treat variables as constants during forward or reverse-mode automatic
+-- differentiation.
+def stop_gradient 't (x: t): t =
+  #[stop_gradient] (\x -> x) x
+
 -- | Jacobian-Vector Product ("forward mode"), producing also the
 -- primal result as the first element of the result tuple.
 let jvp2 'a 'b (f: a -> b) (x: a) (x': a) : (b, b) =
