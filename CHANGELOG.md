@@ -9,9 +9,25 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Added
 
+* Arbitrary expressions of type `i64` are now allowed as sizes.  Work
+  by Lubin Bailly.
+
 ### Removed
 
 ### Changed
+
+* The prelude functions `flatten` and `unflatten` (and their
+  multidimensional variants) have more restrictive types.
+
+### Fixed
+
+* Type checker crash on some ill-typed programs (#1926).
+
+* Some soundness bugs in memory short circuiting (#1927, #1930).
+
+* Another compiler crash in block tiling (#1933).
+
+## [0.24.3]
 
 ### Fixed
 
