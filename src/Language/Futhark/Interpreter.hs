@@ -63,6 +63,8 @@ import Language.Futhark.Primitive qualified as P
 import Language.Futhark.Semantic qualified as T
 import Prelude hiding (break, mod)
 
+import qualified Debug.Trace (trace)
+
 data StackFrame = StackFrame
   { stackFrameLoc :: Loc,
     stackFrameCtx :: Ctx
@@ -398,7 +400,7 @@ fromArray (ValueArray shape as) = (shape, elems as)
 fromArray v = error $ "Expected array value, but found: " <> show v
 
 apply :: SrcLoc -> Env -> Value -> Value -> EvalM Value
-apply loc env (ValueFun f) v = stacking loc env (f v)
+apply loc env (ValueFun f) v = stacking loc env (Debug.Trace.trace ("apply " ++ show v) $ f v)
 apply _ _ f _ = error $ "Cannot apply non-function: " <> show f
 
 apply2 :: SrcLoc -> Env -> Value -> Value -> Value -> EvalM Value
@@ -651,7 +653,7 @@ evalTermVar :: Env -> QualName VName -> StructType -> EvalM Value
 evalTermVar env qv t =
   case lookupVar qv env of
     Just (TermPoly _ v) -> v (expandType env t) =<< evalWithExts env
-    Just (TermValue _ v) -> pure v
+    Just (TermValue _ v) -> Debug.Trace.trace ("evalTermVar " ++ show qv ++ " " ++ show v) $ pure v
     _ -> do
       ss <- map (locText . srclocOf) <$> stacktrace
       error $
@@ -1239,6 +1241,26 @@ initialCtx =
     terms = M.mapMaybeWithKey (const . def . baseString) intrinsics
     types = M.mapMaybeWithKey (const . tdef . baseString) intrinsics
 
+    sintArithOp f =
+      [ (getS, putS, P.doBinOp (f Int8), f Int8),
+        (getS, putS, P.doBinOp (f Int16), f Int16),
+        (getS, putS, P.doBinOp (f Int32), f Int32),
+        (getS, putS, P.doBinOp (f Int64), f Int64)
+      ]
+    uintArithOp f =
+      [ (getU, putU, P.doBinOp (f Int8), f Int8),
+        (getU, putU, P.doBinOp (f Int16), f Int16),
+        (getU, putU, P.doBinOp (f Int32), f Int32),
+        (getU, putU, P.doBinOp (f Int64), f Int64)
+      ]
+    intArithOp f = sintArithOp f ++ uintArithOp f
+    floatArithOp f =
+      [ (getF, putF, P.doBinOp (f Float16), f Float16),
+        (getF, putF, P.doBinOp (f Float32), f Float32),
+        (getF, putF, P.doBinOp (f Float64), f Float64)
+      ]
+    arithOp f g = Just $ bopArithDef $ intArithOp f ++ floatArithOp g
+
     sintOp f =
       [ (getS, putS, P.doBinOp (f Int8)),
         (getS, putS, P.doBinOp (f Int16)),
@@ -1257,7 +1279,6 @@ initialCtx =
         (getF, putF, P.doBinOp (f Float32)),
         (getF, putF, P.doBinOp (f Float64))
       ]
-    arithOp f g = Just $ bopDef $ intOp f ++ floatOp g
 
     flipCmps = map (\(f, g, h) -> (f, g, flip h))
     sintCmp f =
@@ -1385,6 +1406,46 @@ initialCtx =
           y' <- valf y
           retf =<< op x' y'
 
+    -- Duplicated bopDef to avoid implementing all operators for now.
+    bopArithDef fs = fun2 $ \x y ->
+      case (x, y) of
+        (ValuePrim x', ValuePrim y')
+          | Just z <- msum $ map (`bopDef'` (x', y')) fs -> do
+              breakOnNaN [x', y'] z
+              pure $ ValuePrim z
+        (ValueDual u u', ValueDual v v')
+          | Just w <- msum $ map (`bopDef'` (u, v)) fs
+          , Just w' <- msum $ map (`bopTanDef` ((u, u'), (v, v'))) fs -> do
+            breakOnNaN [u, v] w
+            breakOnNaN [u', v'] w'
+            pure $ ValueDual w w'
+        _ ->
+          bad noLoc mempty . docText $
+            "Cannot apply operator to arguments"
+              <+> dquotes (prettyValue x)
+              <+> "and"
+              <+> dquotes (prettyValue y)
+                <> "."
+      where
+        bopDef' (valf, retf, op, _) (x, y) = do
+          x' <- valf x
+          y' <- valf y
+          retf =<< op x' y'
+        bopTanDef (valf, retf, op, op_type) ((u, du), (v, dv)) = do
+          u' <- valf u
+          du' <- valf du
+          v' <- valf v
+          dv' <- valf dv
+          retf =<< tanArith op op_type (u', du') (v', dv')
+        -- Arithmetic over dual numbers, but only tangent part.
+        tanArith op (P.FMul ftype) (u, du) (v, dv) = do
+          a <- op u dv
+          b <- op du v
+          (P.doBinOp (P.FAdd ftype)) a b
+        tanArith op (P.FAdd _) (_, du) (_, dv) = do
+          op du dv
+        tanArith _ _ _ _ = Nothing
+
     unopDef fs = fun1 $ \x ->
       case x of
         (ValuePrim x')
@@ -1427,7 +1488,12 @@ initialCtx =
             (getU, putU, P.doUnOp $ P.Complement Int64),
             (getB, putB, P.doUnOp P.Not)
           ]
+    -- def "+" = arithOp (`P.Add` P.OverflowWrap) P.FAdd
     def "+" = arithOp (`P.Add` P.OverflowWrap) P.FAdd
+    --      = Just $ bopDef $ intOp (`P.Add` P.OverflowWrap) ++ floatOp P.FAdd
+    --      = Just $ bopDef $ [ (getF, putF, P.doBinOp (P.FAdd Float16)),
+    --                          (getF, putF, P.doBinOp (P.FAdd Float32)),
+    --                          ... ]
     def "-" = arithOp (`P.Sub` P.OverflowWrap) P.FSub
     def "*" = arithOp (`P.Mul` P.OverflowWrap) P.FMul
     def "**" = arithOp P.Pow P.FPow
@@ -1903,8 +1969,36 @@ initialCtx =
       fun3 $
         \_ _ _ -> bad noLoc mempty "Interpreter does not support autodiff."
     def "jvp2" = Just $
-      fun3 $
-        \_ _ _ -> bad noLoc mempty "Interpreter does not support autodiff."
+      fun3 $ \f x x' ->
+        case (x, x') of
+          (ValuePrim v, ValuePrim dv) -> localLiftEnv $ do
+            --  TODO toTuple z z'
+            Debug.Trace.trace ("jvp2 f:" ++ show f ++ " v: " ++ show v ++ " dv: " ++ show dv)
+                              (apply noLoc mempty f $ ValueDual v dv)
+          _ ->
+            bad noLoc mempty "Interpreter does not support autodiff."
+      where
+        -- Lift free variables to dual numbers, while nesting existing dual numbers
+        -- to form scope that avoids pertubation confusion.
+        localLiftEnv = local (\(s, imports) -> (s, M.map (\env -> env { envTerm = M.map addTan $ envTerm env }) imports))
+
+        addTan (TermValue a (ValuePrim v)) = Debug.Trace.trace "addTan prim" $ TermValue a (ValueDual v (zero v))
+        -- addTan (TermValue a v@(ValueDual _ _)) = TermValue a (ValueDual v 0) -- TODO
+        addTan other = Debug.Trace.trace "addTan other" $ other -- TODO
+
+        zero :: Language.Futhark.PrimValue -> Language.Futhark.PrimValue
+        zero (SignedValue (P.Int8Value {})) = SignedValue $ Int8Value 0
+        zero (SignedValue (P.Int16Value {})) = SignedValue $ Int16Value 0
+        zero (SignedValue (P.Int32Value {})) = SignedValue $ Int32Value 0
+        zero (SignedValue (P.Int64Value {})) = SignedValue $ Int64Value 0
+        zero (UnsignedValue (P.Int8Value {})) = UnsignedValue $ Int8Value 0
+        zero (UnsignedValue (P.Int16Value {})) = UnsignedValue $ Int16Value 0
+        zero (UnsignedValue (P.Int32Value {})) = UnsignedValue $ Int32Value 0
+        zero (UnsignedValue (P.Int64Value {})) = UnsignedValue $ Int64Value 0
+        zero (FloatValue (P.Float16Value {})) = FloatValue $ Float16Value 0.0
+        zero (FloatValue (P.Float32Value {})) = FloatValue $ Float32Value 0.0
+        zero (FloatValue (P.Float64Value {})) = FloatValue $ Float64Value 0.0
+        zero (BoolValue {}) = BoolValue $ False
     def "acc" = Nothing
     def s | nameFromString s `M.member` namesToPrimTypes = Nothing
     def s = error $ "Missing intrinsic: " ++ s
@@ -1995,7 +2089,7 @@ interpretFunction ctx fname vs = do
     _ ->
       Left $ "Unknown function `" <> nameToText (toName fname) <> "`."
 
-  let vs' = map fromDataValue vs
+  let vs' = Debug.Trace.trace ("interpretFunction " ++ show fname) $ map fromDataValue vs
 
   checkEntryArgs fname vs ft
 

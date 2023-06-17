@@ -106,6 +106,8 @@ data Value m
     ValueSum ValueShape Name [Value m]
   | -- The shape, the update function, and the array.
     ValueAcc ValueShape (Value m -> Value m -> m (Value m)) !(Array Int (Value m))
+  | -- Dual number used for forward mode AD.
+  ValueDual !PrimValue !PrimValue -- TODO extend to (Value m, !PrimValue)
 
 instance Show (Value m) where
   show (ValuePrim v) = "ValuePrim " <> show v <> ""
@@ -114,6 +116,7 @@ instance Show (Value m) where
   show (ValueSum shape c vs) = unwords ["ValueSum", show shape, show c, show vs]
   show ValueFun {} = "ValueFun _"
   show ValueAcc {} = "ValueAcc _"
+  show (ValueDual v v') = unwords ["ValueDual", show v, show v']
 
 instance Eq (Value m) where
   ValuePrim (SignedValue x) == ValuePrim (SignedValue y) =
@@ -128,6 +131,7 @@ instance Eq (Value m) where
   ValueRecord x == ValueRecord y = x == y
   ValueSum _ n1 vs1 == ValueSum _ n2 vs2 = n1 == n2 && vs1 == vs2
   ValueAcc _ _ x == ValueAcc _ _ y = x == y
+  ValueDual x x' == ValueDual y y' = x == y && x' == y'
   _ == _ = False
 
 prettyValueWith :: (PrimValue -> Doc a) -> Value m -> Doc a
@@ -145,6 +149,11 @@ prettyValueWith pprPrim = pprPrec 0
     pprPrec _ ValueAcc {} = "#<acc>"
     pprPrec p (ValueSum _ n vs) =
       parensIf (p > (0 :: Int)) $ "#" <> sep (pretty n : map (pprPrec 1) vs)
+    pprPrec _ (ValueDual v v') =
+      "(" <> pprPrim v <> " + " <> pprPrim v' <> "eps)" -- TODO pprPrec 0
+      -- TODO
+      -- parens $ align $ vsep $ punctuate comma $ map p (v, v')
+      --                                               ^(pprPrec 0)
     pprElem v@ValueArray {} = pprPrec 0 v
     pprElem v = group $ pprPrec 0 v
 
