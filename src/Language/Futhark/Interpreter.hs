@@ -701,6 +701,7 @@ evalFunction env missing_sizes [] body rettype =
       f <- localExts $ eval env' body
       foldM (apply noLoc mempty) f $ reverse vs
 evalFunction env missing_sizes (p : ps) body rettype =
+  Debug.Trace.trace ("evalFunction") $
   pure . ValueFun $ \v -> do
     env' <- linkMissingSizes missing_sizes p v <$> matchPat env p v
     evalFunction env' missing_sizes ps body rettype
@@ -854,6 +855,7 @@ evalAppExp
 evalAppExp env _ (If cond e1 e2 _) = do
   cond' <- asBool <$> eval env cond
   if cond' then eval env e1 else eval env e2
+-- TODO find jvp in case below and modify env here?
 evalAppExp env _ (Apply f args loc) = do
   -- It is important that 'arguments' are evaluated in reverse order
   -- in order to bring any sizes into scope that may be used in the
@@ -1419,6 +1421,18 @@ initialCtx =
             breakOnNaN [u, v] w
             breakOnNaN [u', v'] w'
             pure $ ValueDual w w'
+        (ValueDual u u', ValuePrim v)
+          | Just w <- msum $ map (`bopDef'` (u, v)) fs
+          , Just w' <- msum $ map (`bopTanDef` ((u, u'), (v, zero v))) fs -> do
+            breakOnNaN [u, v] w
+            breakOnNaN [u', zero v] w'
+            pure $ ValueDual w w'
+        (ValuePrim u, ValueDual v v')
+          | Just w <- msum $ map (`bopDef'` (u, v)) fs
+          , Just w' <- msum $ map (`bopTanDef` ((u, zero u), (v, v'))) fs -> do
+            breakOnNaN [u, v] w
+            breakOnNaN [zero u, v'] w'
+            pure $ ValueDual w w'
         _ ->
           bad noLoc mempty . docText $
             "Cannot apply operator to arguments"
@@ -1438,13 +1452,42 @@ initialCtx =
           dv' <- valf dv
           retf =<< tanArith op op_type (u', du') (v', dv')
         -- Arithmetic over dual numbers, but only tangent part.
+        tanArith op (P.FAdd _) (_, du) (_, dv) = do
+          op du dv
+        tanArith op (P.FSub _) (_, du) (_, dv) = do
+          op du dv
         tanArith op (P.FMul ftype) (u, du) (v, dv) = do
           a <- op u dv
           b <- op du v
           (P.doBinOp (P.FAdd ftype)) a b
-        tanArith op (P.FAdd _) (_, du) (_, dv) = do
-          op du dv
+        tanArith _ (P.FDiv ftype) (u, du) (v, dv) = do
+          -- -u*dv/(v*v) + du / v
+          x <- neg =<< u * dv
+          y <- v * v
+          a <- x / y
+          b <- du / v
+          a + b
+          where
+            (*) = P.doBinOp (P.FMul ftype)
+            (/) = P.doBinOp (P.FDiv ftype)
+            (+) = P.doBinOp (P.FAdd ftype)
+            zero' = P.blankPrimValue . P.primValueType
+            neg x = P.doBinOp (P.FSub ftype) (zero' x) x
         tanArith _ _ _ _ = Nothing
+
+        zero :: Language.Futhark.PrimValue -> Language.Futhark.PrimValue
+        zero (SignedValue (P.Int8Value {})) = SignedValue $ Int8Value 0
+        zero (SignedValue (P.Int16Value {})) = SignedValue $ Int16Value 0
+        zero (SignedValue (P.Int32Value {})) = SignedValue $ Int32Value 0
+        zero (SignedValue (P.Int64Value {})) = SignedValue $ Int64Value 0
+        zero (UnsignedValue (P.Int8Value {})) = UnsignedValue $ Int8Value 0
+        zero (UnsignedValue (P.Int16Value {})) = UnsignedValue $ Int16Value 0
+        zero (UnsignedValue (P.Int32Value {})) = UnsignedValue $ Int32Value 0
+        zero (UnsignedValue (P.Int64Value {})) = UnsignedValue $ Int64Value 0
+        zero (FloatValue (P.Float16Value {})) = FloatValue $ Float16Value 0.0
+        zero (FloatValue (P.Float32Value {})) = FloatValue $ Float32Value 0.0
+        zero (FloatValue (P.Float64Value {})) = FloatValue $ Float64Value 0.0
+        zero (BoolValue {}) = undefined
 
     unopDef fs = fun1 $ \x ->
       case x of
@@ -1499,10 +1542,10 @@ initialCtx =
     def "**" = arithOp P.Pow P.FPow
     def "/" =
       Just $
-        bopDef $
-          sintOp (`P.SDiv` P.Unsafe)
-            ++ uintOp (`P.UDiv` P.Unsafe)
-            ++ floatOp P.FDiv
+        bopArithDef $
+          sintArithOp (`P.SDiv` P.Unsafe)
+            ++ uintArithOp (`P.UDiv` P.Unsafe)
+            ++ floatArithOp P.FDiv
     def "%" =
       Just $
         bopDef $
@@ -1971,34 +2014,12 @@ initialCtx =
     def "jvp2" = Just $
       fun3 $ \f x x' ->
         case (x, x') of
-          (ValuePrim v, ValuePrim dv) -> localLiftEnv $ do
+          (ValuePrim v, ValuePrim dv) -> do
             --  TODO toTuple z z'
             Debug.Trace.trace ("jvp2 f:" ++ show f ++ " v: " ++ show v ++ " dv: " ++ show dv)
                               (apply noLoc mempty f $ ValueDual v dv)
           _ ->
             bad noLoc mempty "Interpreter does not support autodiff."
-      where
-        -- Lift free variables to dual numbers, while nesting existing dual numbers
-        -- to form scope that avoids pertubation confusion.
-        localLiftEnv = local (\(s, imports) -> (s, M.map (\env -> env { envTerm = M.map addTan $ envTerm env }) imports))
-
-        addTan (TermValue a (ValuePrim v)) = Debug.Trace.trace "addTan prim" $ TermValue a (ValueDual v (zero v))
-        -- addTan (TermValue a v@(ValueDual _ _)) = TermValue a (ValueDual v 0) -- TODO
-        addTan other = Debug.Trace.trace "addTan other" $ other -- TODO
-
-        zero :: Language.Futhark.PrimValue -> Language.Futhark.PrimValue
-        zero (SignedValue (P.Int8Value {})) = SignedValue $ Int8Value 0
-        zero (SignedValue (P.Int16Value {})) = SignedValue $ Int16Value 0
-        zero (SignedValue (P.Int32Value {})) = SignedValue $ Int32Value 0
-        zero (SignedValue (P.Int64Value {})) = SignedValue $ Int64Value 0
-        zero (UnsignedValue (P.Int8Value {})) = UnsignedValue $ Int8Value 0
-        zero (UnsignedValue (P.Int16Value {})) = UnsignedValue $ Int16Value 0
-        zero (UnsignedValue (P.Int32Value {})) = UnsignedValue $ Int32Value 0
-        zero (UnsignedValue (P.Int64Value {})) = UnsignedValue $ Int64Value 0
-        zero (FloatValue (P.Float16Value {})) = FloatValue $ Float16Value 0.0
-        zero (FloatValue (P.Float32Value {})) = FloatValue $ Float32Value 0.0
-        zero (FloatValue (P.Float64Value {})) = FloatValue $ Float64Value 0.0
-        zero (BoolValue {}) = BoolValue $ False
     def "acc" = Nothing
     def s | nameFromString s `M.member` namesToPrimTypes = Nothing
     def s = error $ "Missing intrinsic: " ++ s
