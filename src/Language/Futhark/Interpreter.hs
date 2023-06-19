@@ -2015,11 +2015,20 @@ initialCtx =
       fun3 $ \f x x' ->
         case (x, x') of
           (ValuePrim v, ValuePrim dv) -> do
-            --  TODO toTuple z z'
             Debug.Trace.trace ("jvp2 f:" ++ show f ++ " v: " ++ show v ++ " dv: " ++ show dv)
+                              -- (fmap tup (apply noLoc mempty f $ ValueDual v dv))
                               (apply noLoc mempty f $ ValueDual v dv)
+          (ValueArray shape vs, ValueArray _ dvs) -> do
+            let duals = map toDual $ zip (elems vs) (elems dvs)
+            Debug.Trace.trace ("jvp2 array:" ++ show duals) $
+              apply noLoc mempty f (toArray' shape duals)
           _ ->
             bad noLoc mempty "Interpreter does not support autodiff."
+        where
+          toDual (ValuePrim v, ValuePrim dv) = ValueDual v dv
+          toDual _ = undefined -- TODO fix
+          tup (ValueDual z dz) = toTuple [ValuePrim z, ValuePrim dz]
+          tup _ = undefined -- TODO fix
     def "acc" = Nothing
     def s | nameFromString s `M.member` namesToPrimTypes = Nothing
     def s = error $ "Missing intrinsic: " ++ s
