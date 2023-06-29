@@ -107,7 +107,7 @@ newNamesForMTy orig_mty = do
 
         -- For applySubst and friends.
         subst v =
-          ExpSubst . flip sizeVar mempty . qualName <$> M.lookup v substs
+          ExpSubst . flip sizeFromName mempty . qualName <$> M.lookup v substs
 
         substituteInMap f m =
           let (ks, vs) = unzip $ M.toList m
@@ -154,14 +154,10 @@ newNamesForMTy orig_mty = do
         substituteInType (Scalar (Arrow als v d1 t1 (RetType dims t2))) =
           Scalar $ Arrow als v d1 (substituteInType t1) $ RetType dims $ substituteInType t2
 
-        substituteInShape (Shape ds) = Shape $ map substituteInDim ds
-        substituteInDim (SizeExpr e) = SizeExpr $ applySubst subst e
-        substituteInDim AnySize {} = error "substituteInDim: AnySize"
+        substituteInShape (Shape ds) = Shape $ map (applySubst subst) ds
 
-        substituteInTypeArg (TypeArgDim (SizeExpr e)) =
-          TypeArgDim $ SizeExpr (applySubst subst e)
-        substituteInTypeArg (TypeArgDim AnySize {}) =
-          error "substituteInTypeArg: AnySize"
+        substituteInTypeArg (TypeArgDim e) =
+          TypeArgDim $ applySubst subst e
         substituteInTypeArg (TypeArgType t) =
           TypeArgType $ substituteInType t
 
@@ -388,7 +384,7 @@ matchMTys ::
   Either TypeError (M.Map VName VName)
 matchMTys orig_mty orig_mty_sig =
   matchMTys'
-    (M.map (ExpSubst . flip sizeVar mempty) $ resolveMTyNames orig_mty orig_mty_sig)
+    (M.map (ExpSubst . flip sizeFromName mempty) $ resolveMTyNames orig_mty orig_mty_sig)
     []
     orig_mty
     orig_mty_sig
@@ -548,8 +544,7 @@ matchMTys orig_mty orig_mty_sig =
       let spec_t' = applySubst (`M.lookup` abs_subst_to_type) spec_t
           nonrigid = ps <> map (`TypeParamDim` mempty) (retDims t)
       case doUnification loc spec_ps nonrigid (retType spec_t') (retType t) of
-        Right t'
-          | noSizes t' `subtypeOf` noSizes (retType spec_t') -> pure (spec_name, name)
+        Right _ -> pure (spec_name, name)
         _ -> nomatch spec_t'
       where
         nomatch spec_t' =
@@ -579,18 +574,15 @@ matchMTys orig_mty orig_mty_sig =
                 </> indent 2 (ppValBind (QualName quals spec_name) spec_v)
                 </> "but module provides"
                 </> indent 2 (ppValBind (QualName quals spec_name) v)
-                </> fromMaybe mempty problem
+                </> problem
 
-    matchValBinding :: Loc -> BoundV -> BoundV -> Maybe (Maybe (Doc ()))
+    matchValBinding :: Loc -> BoundV -> BoundV -> Maybe (Doc ())
     matchValBinding loc (BoundV spec_tps orig_spec_t) (BoundV tps orig_t) = do
       case doUnification loc spec_tps tps (toStruct orig_spec_t) (toStruct orig_t) of
         Left (TypeError _ notes msg) ->
-          Just $ Just $ msg <> pretty notes
-        -- Even if they unify, we still have to verify the uniqueness
-        -- properties.
-        Right t
-          | noSizes t `subtypeOf` noSizes orig_spec_t -> Nothing
-          | otherwise -> Just Nothing
+          Just $ msg <> pretty notes
+        Right _ ->
+          Nothing
 
     ppValBind v (BoundV tps t) =
       "val"
@@ -616,7 +608,7 @@ applyFunctor applyloc (FunSig p_abs p_mod body_mty) a_mty = do
   let a_abbrs = mtyTypeAbbrs a_mty
       isSub v = case M.lookup v a_abbrs of
         Just abbr -> Just $ substFromAbbr abbr
-        _ -> Just $ ExpSubst $ sizeVar (qualName v) mempty
+        _ -> Just $ ExpSubst $ sizeFromName (qualName v) mempty
       type_subst = M.mapMaybe isSub p_subst
       body_mty' = substituteTypesInMTy (`M.lookup` type_subst) body_mty
   (body_mty'', body_subst) <- newNamesForMTy body_mty'

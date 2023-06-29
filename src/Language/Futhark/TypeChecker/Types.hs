@@ -2,8 +2,6 @@
 module Language.Futhark.TypeChecker.Types
   ( checkTypeExp,
     renameRetType,
-    subtypeOf,
-    subuniqueOf,
     returnType,
     addAliasesFromType,
     checkForDuplicateNames,
@@ -29,7 +27,6 @@ import Control.Monad.State
 import Data.Bifunctor
 import Data.List (find, foldl', sort, unzip4, (\\))
 import Data.Map.Strict qualified as M
-import Data.Maybe
 import Data.Set qualified as S
 import Futhark.Util (nubOrd)
 import Futhark.Util.Pretty
@@ -41,15 +38,13 @@ mustBeExplicitAux :: StructType -> M.Map VName Bool
 mustBeExplicitAux t =
   execState (traverseDims onDim t) mempty
   where
-    onDim bound _ (SizeExpr (Var d _ _))
+    onDim bound _ (Var d _ _)
       | qualLeaf d `S.member` bound =
           modify $ \s -> M.insertWith (&&) (qualLeaf d) False s
-    onDim _ PosImmediate (SizeExpr (Var d _ _)) =
+    onDim _ PosImmediate (Var d _ _) =
       modify $ \s -> M.insertWith (&&) (qualLeaf d) False s
-    onDim _ _ (SizeExpr e) =
-      modify $ M.unionWith (&&) (M.map (const True) (unFV $ freeInExp e))
-    onDim _ _ _ =
-      pure ()
+    onDim _ _ e =
+      modify $ flip (S.foldr (\v -> M.insertWith (&&) v True)) $ fvVars $ freeInExp e
 
 -- | Determine which of the sizes in a type are used as sizes outside
 -- of functions in the type, and which are not.  The former are said
@@ -68,7 +63,7 @@ determineSizeWitnesses t =
 mustBeExplicitInBinding :: StructType -> S.Set VName
 mustBeExplicitInBinding bind_t =
   let (ts, ret) = unfoldFunType bind_t
-      alsoRet = M.unionWith (&&) $ M.map (const True) $ unFV $ freeInType ret
+      alsoRet = M.unionWith (&&) $ M.fromList $ zip (S.toList (fvVars (freeInType ret))) (repeat True)
    in S.fromList $ M.keys $ M.filter id $ alsoRet $ foldl' onType mempty $ map snd ts
   where
     onType uses t = uses <> mustBeExplicitAux t -- Left-biased union.
@@ -142,90 +137,13 @@ addAliasesFromType (Scalar (Prim t)) _ = Scalar $ Prim t
 addAliasesFromType t1 t2 =
   error $ "addAliasesFromType invalid args: " ++ show (t1, t2)
 
--- | @unifyTypes uf t1 t2@ attempts to unify @t1@ and @t2@.  If
--- unification cannot happen, 'Nothing' is returned, otherwise a type
--- that combines the aliasing of @t1@ and @t2@ is returned.
--- Uniqueness is unified with @uf@.  Assumes sizes already match, and
--- always picks the size of the leftmost type.
-unifyTypesU ::
-  (Monoid als) =>
-  (Uniqueness -> Uniqueness -> Maybe Uniqueness) ->
-  TypeBase dim als ->
-  TypeBase dim als ->
-  Maybe (TypeBase dim als)
-unifyTypesU uf (Array als1 u1 shape1 et1) (Array als2 u2 _shape2 et2) =
-  Array (als1 <> als2)
-    <$> uf u1 u2
-    <*> pure shape1
-    <*> unifyScalarTypes uf et1 et2
-unifyTypesU uf (Scalar t1) (Scalar t2) = Scalar <$> unifyScalarTypes uf t1 t2
-unifyTypesU _ _ _ = Nothing
-
-unifyScalarTypes ::
-  (Monoid als) =>
-  (Uniqueness -> Uniqueness -> Maybe Uniqueness) ->
-  ScalarTypeBase dim als ->
-  ScalarTypeBase dim als ->
-  Maybe (ScalarTypeBase dim als)
-unifyScalarTypes _ (Prim t1) (Prim t2)
-  | t1 == t2 = Just $ Prim t1
-  | otherwise = Nothing
-unifyScalarTypes uf (TypeVar als1 u1 tv1 targs1) (TypeVar als2 u2 tv2 targs2)
-  | tv1 == tv2 = do
-      u3 <- uf u1 u2
-      targs3 <- zipWithM unifyTypeArgs targs1 targs2
-      Just $ TypeVar (als1 <> als2) u3 tv1 targs3
-  | otherwise = Nothing
-  where
-    unifyTypeArgs (TypeArgDim d1) (TypeArgDim _d2) =
-      pure $ TypeArgDim d1
-    unifyTypeArgs (TypeArgType t1) (TypeArgType t2) =
-      TypeArgType <$> unifyTypesU uf t1 t2
-    unifyTypeArgs _ _ =
-      Nothing
-unifyScalarTypes uf (Record ts1) (Record ts2)
-  | length ts1 == length ts2,
-    sort (M.keys ts1) == sort (M.keys ts2) =
-      Record
-        <$> traverse
-          (uncurry (unifyTypesU uf))
-          (M.intersectionWith (,) ts1 ts2)
-unifyScalarTypes
-  uf
-  (Arrow as1 mn1 d1 t1 (RetType dims1 t1'))
-  (Arrow as2 _ _ t2 (RetType _ t2')) =
-    Arrow (as1 <> as2) mn1 d1
-      <$> unifyTypesU (flip uf) t1 t2
-      <*> (RetType dims1 <$> unifyTypesU uf t1' t2')
-unifyScalarTypes uf (Sum cs1) (Sum cs2)
-  | length cs1 == length cs2,
-    sort (M.keys cs1) == sort (M.keys cs2) =
-      Sum
-        <$> traverse
-          (uncurry (zipWithM (unifyTypesU uf)))
-          (M.intersectionWith (,) cs1 cs2)
-unifyScalarTypes _ _ _ = Nothing
-
--- | @x \`subtypeOf\` y@ is true if @x@ is a subtype of @y@ (or equal
--- to @y@), meaning @x@ is valid whenever @y@ is.  Ignores sizes.
--- Mostly used for checking uniqueness.
-subtypeOf :: TypeBase () () -> TypeBase () () -> Bool
-subtypeOf t1 t2 = isJust $ unifyTypesU unifyUniqueness (toStruct t1) (toStruct t2)
-  where
-    unifyUniqueness u2 u1 = if u2 `subuniqueOf` u1 then Just u1 else Nothing
-
--- | @x `subuniqueOf` y@ is true if @x@ is not less unique than @y@.
-subuniqueOf :: Uniqueness -> Uniqueness -> Bool
-subuniqueOf Nonunique Unique = False
-subuniqueOf _ _ = True
-
 -- | Ensure that the dimensions of the RetType are unique by
 -- generating new names for them.  This is to avoid name capture.
 renameRetType :: MonadTypeChecker m => StructRetType -> m StructRetType
 renameRetType (RetType dims st)
   | dims /= mempty = do
       dims' <- mapM newName dims
-      let mkSubst = ExpSubst . flip sizeVar mempty . qualName
+      let mkSubst = ExpSubst . flip sizeFromName mempty . qualName
           m = M.fromList . zip dims $ map mkSubst dims'
           st' = applySubst (`M.lookup` m) st
       pure $ RetType dims' st'
@@ -306,7 +224,7 @@ evalTypeExp (TEArray d t loc) = do
       pure ([dv], SizeExpAny dloc, sizeFromName (qualName dv) dloc)
     checkSizeExp (SizeExp e dloc) = do
       e' <- checkExpForSize e
-      pure ([], SizeExp e' dloc, SizeExpr e')
+      pure ([], SizeExp e' dloc, e')
 --
 evalTypeExp (TEUnique t loc) = do
   (t', svars, RetType dims st, l) <- evalTypeExp t
@@ -442,7 +360,7 @@ evalTypeExp ote@TEApply {} = do
       pure
         ( TypeArgExpSize (SizeExpAny loc),
           [d],
-          ExpSubst $ sizeVar (qualName d) loc
+          ExpSubst $ sizeFromName (qualName d) loc
         )
 
     checkArgApply (TypeParamDim pv _) (TypeArgExpSize d) = do
@@ -661,19 +579,6 @@ instance Substitutable Exp where
             mapOnPatRetType = pure . applySubst f
           }
 
-instance Substitutable Size where
-  applySubst f size = runIdentity $ astMap mapper size
-    where
-      mapper =
-        ASTMapper
-          { mapOnExp = pure . applySubst f,
-            mapOnName = pure,
-            mapOnStructType = pure . applySubst f,
-            mapOnPatType = pure . applySubst f,
-            mapOnStructRetType = pure . applySubst f,
-            mapOnPatRetType = pure . applySubst f
-          }
-
 instance Substitutable d => Substitutable (Shape d) where
   applySubst f = fmap $ applySubst f
 
@@ -700,7 +605,7 @@ applyType ps t args = substTypesAny (`M.lookup` substs) t
   where
     substs = M.fromList $ zipWith mkSubst ps args
     -- We are assuming everything has already been type-checked for correctness.
-    mkSubst (TypeParamDim pv _) (TypeArgDim (SizeExpr e)) =
+    mkSubst (TypeParamDim pv _) (TypeArgDim e) =
       (pv, ExpSubst e)
     mkSubst (TypeParamType _ pv _) (TypeArgType at) =
       (pv, Subst [] $ RetType [] $ second mempty at)
@@ -732,7 +637,7 @@ substTypesRet lookupSubst ot =
         else do
           let start = maximum $ map baseTag seen_ext
               ext' = zipWith VName (map baseName ext) [start + 1 ..]
-              mkSubst = ExpSubst . flip sizeVar mempty . qualName
+              mkSubst = ExpSubst . flip sizeFromName mempty . qualName
               extsubsts = M.fromList $ zip ext $ map mkSubst ext'
               RetType [] t' = substTypesRet (`M.lookup` extsubsts) t
           pure $ RetType ext' t'
@@ -803,8 +708,7 @@ substTypesAny lookupSubst ot =
       -- AnySize.  This should _never_ happen during type-checking, but
       -- may happen as we substitute types during monomorphisation and
       -- defunctorisation later on. See Note [AnySize]
-      let toAny (SizeExpr (Var v _ _))
-            | qualLeaf v `elem` dims = AnySize Nothing
+      let toAny (Var v _ _) | qualLeaf v `elem` dims = anySize
           toAny d = d
        in first toAny ot'
 

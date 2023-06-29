@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+* `futhark doc` produced some invalid links.
+
+* `flatten` did not properly check for claimed negative array sizes.
+
 * Type checker crash on some ill-typed programs (#1926).
 
 * Some soundness bugs in memory short circuiting (#1927, #1930).
@@ -34,6 +38,24 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 * Another compiler crash in block tiling (#1933, #1940).
 
 * Global arrays with size parameters no longer have aliases.
+
+* `futhark eval` no longer crashes on ambiguously typed expressions (#1946).
+
+* A code motion pass was ignorant of consumption constraints, leading
+  to compiler crash (#1947).
+
+* Type checker could get confused and think unknown sizes were
+  available when they really weren't (#1950).
+
+* Some index optimisations removed certificates (#1952).
+
+* GPU backends can now transpose arrays whose size does not fit in a
+  32-bit integer (#1953).
+
+* Bug in alias checking for the core language type checker (#1949).
+  Actually (finally) a proper fix of #803.
+
+* Defunctionalisation duplicates less code (#1968).
 
 ## [0.24.3]
 

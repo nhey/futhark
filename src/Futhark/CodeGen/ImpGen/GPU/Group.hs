@@ -286,7 +286,7 @@ compileGroupExp _ (BasicOp (UpdateAcc acc is vs)) = do
   ltid <- kernelLocalThreadId . kernelConstants <$> askEnv
   sWhen (ltid .==. 0) $ updateAcc acc is vs
   sOp $ Imp.Barrier Imp.FenceLocal
-compileGroupExp (Pat [dest]) (BasicOp (Replicate ds se)) = do
+compileGroupExp (Pat [dest]) (BasicOp (Replicate ds se)) | ds /= mempty = do
   flat <- newVName "rep_flat"
   is <- replicateM (arrayRank dest_t) (newVName "rep_i")
   let is' = map le64 is
@@ -295,14 +295,6 @@ compileGroupExp (Pat [dest]) (BasicOp (Replicate ds se)) = do
   sOp $ Imp.Barrier Imp.FenceLocal
   where
     dest_t = patElemType dest
-compileGroupExp (Pat [dest]) (BasicOp (Rotate rs arr)) = do
-  ds <- map pe64 . arrayDims <$> lookupType arr
-  groupCoverSpace ds $ \is -> do
-    is' <- sequence $ zipWith3 rotate ds rs is
-    copyDWIMFix (patElemName dest) is (Var arr) is'
-  sOp $ Imp.Barrier Imp.FenceLocal
-  where
-    rotate d r i = dPrimVE "rot_i" $ rotateIndex d (pe64 r) i
 compileGroupExp (Pat [dest]) (BasicOp (Iota n e s it)) = do
   n' <- toExp n
   e' <- toExp e
@@ -695,8 +687,6 @@ segOpSizes = onStms
     onStm (Let (Pat [pe]) _ (BasicOp (Replicate {}))) =
       S.singleton $ arrayDims $ patElemType pe
     onStm (Let (Pat [pe]) _ (BasicOp (Iota {}))) =
-      S.singleton $ arrayDims $ patElemType pe
-    onStm (Let (Pat [pe]) _ (BasicOp (Copy {}))) =
       S.singleton $ arrayDims $ patElemType pe
     onStm (Let (Pat [pe]) _ (BasicOp (Manifest {}))) =
       S.singleton $ arrayDims $ patElemType pe

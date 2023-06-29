@@ -90,7 +90,6 @@ module Futhark.CodeGen.ImpGen
     dPrimVE,
     dIndexSpace,
     dIndexSpace',
-    rotateIndex,
     sFor,
     sWhile,
     sComment,
@@ -684,7 +683,7 @@ compileFunDef types (FunDef entry _ fname rettype params body) =
       Just (x, y, z) -> (Just x, Just y, Just z)
     compile = do
       (inparams, arrayds, args) <- compileInParams types params params_entry
-      (results, outparams, dests) <- compileOutParams types rettype ret_entry
+      (results, outparams, dests) <- compileOutParams types (map fst rettype) ret_entry
       addFParams params
       addArrays arrayds
 
@@ -937,6 +936,8 @@ defCompileBasicOp (Pat [pe]) (FlatUpdate _ slice v) = do
     slice' = fmap pe64 slice
 defCompileBasicOp (Pat [pe]) (Replicate shape se)
   | Acc {} <- patElemType pe = pure ()
+  | shape == mempty =
+      copyDWIM (patElemName pe) [] se []
   | otherwise =
       sLoopNest shape $ \is -> copyDWIMFix (patElemName pe) is se []
 defCompileBasicOp _ Scratch {} =
@@ -951,8 +952,6 @@ defCompileBasicOp (Pat [pe]) (Iota n e s it) = do
         BinOpExp (Add it OverflowUndef) e' $
           BinOpExp (Mul it OverflowUndef) i' s'
     copyDWIM (patElemName pe) [DimFix i] (Var (tvVar x)) []
-defCompileBasicOp (Pat [pe]) (Copy src) =
-  copyDWIM (patElemName pe) [] (Var src) []
 defCompileBasicOp (Pat [pe]) (Manifest _ src) =
   copyDWIM (patElemName pe) [] (Var src) []
 defCompileBasicOp (Pat [pe]) (Concat i (x :| ys) _) = do
@@ -988,13 +987,6 @@ defCompileBasicOp (Pat [pe]) (ArrayLit es _)
     isLiteral _ = Nothing
 defCompileBasicOp _ Rearrange {} =
   pure ()
-defCompileBasicOp (Pat [pe]) (Rotate rs arr) = do
-  shape <- arrayShape <$> lookupType arr
-  sLoopNest shape $ \is -> do
-    is' <- sequence $ zipWith3 rotate (shapeDims shape) rs is
-    copyDWIMFix (patElemName pe) is (Var arr) is'
-  where
-    rotate d r i = dPrimVE "rot_i" $ rotateIndex (pe64 d) (pe64 r) i
 defCompileBasicOp _ Reshape {} =
   pure ()
 defCompileBasicOp _ (UpdateAcc acc is vs) = sComment "UpdateAcc" $ do
@@ -1755,13 +1747,6 @@ inBounds (Slice slice) dims =
    in foldl1 (.&&.) $ zipWith condInBounds slice dims
 
 --- Building blocks for constructing code.
-
-rotateIndex ::
-  Imp.TExp Int64 ->
-  Imp.TExp Int64 ->
-  Imp.TExp Int64 ->
-  Imp.TExp Int64
-rotateIndex d r i = (i + r) `mod` d
 
 sFor' :: VName -> Imp.Exp -> ImpM rep r op () -> ImpM rep r op ()
 sFor' i bound body = do

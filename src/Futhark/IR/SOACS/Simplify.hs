@@ -271,7 +271,7 @@ liftIdentityMapping _ pat aux op
             where
               e inp = case patElemType outId of
                 Acc {} -> BasicOp $ SubExp $ Var inp
-                _ -> BasicOp (Copy inp)
+                _ -> BasicOp (Replicate mempty (Var inp))
           checkInvariance (outId, SubExpRes _ e, t) (invariant, mapresult, rettype')
             | freeOrConst e =
                 ( (Pat [outId], BasicOp $ Replicate (Shape [w]) e) : invariant,
@@ -308,7 +308,7 @@ liftIdentityStreaming _ (Pat pes) aux (Stream w arrs nes lam)
       partitionEithers $ map isInvariantRes $ zip3 map_ts map_pes map_res,
     not $ null invariant_map = Simplify $ do
       forM_ invariant_map $ \(pe, arr) ->
-        letBind (Pat [pe]) $ BasicOp $ Copy arr
+        letBind (Pat [pe]) $ BasicOp $ Replicate mempty $ Var arr
 
       let (variant_map_ts, variant_map_pes, variant_map_res) = unzip3 variant_map
           lam' =
@@ -462,7 +462,7 @@ removeDuplicateMapOutput _ (Pat pes) aux (Screma w arrs form)
                       }
               auxing aux $ letBind (Pat pes') $ Op $ Screma w arrs $ mapSOAC fun'
               forM_ copies $ \(from, to) ->
-                letBind (Pat [to]) $ BasicOp $ Copy $ patElemName from
+                letBind (Pat [to]) $ BasicOp $ Replicate mempty $ Var $ patElemName from
   where
     checkForDuplicates (ses_ts_pes', copies) (se, t, pe)
       | Just (_, _, pe') <- find (\(x, _, _) -> resSubExp x == resSubExp se) ses_ts_pes' =
@@ -493,12 +493,6 @@ mapOpToOp (_, used) pat aux1 e
     not $ UT.isConsumed (patElemName map_pe) used =
       Simplify . certifying (stmAuxCerts aux1 <> cs) . letBind pat . BasicOp $
         Rearrange (0 : map (1 +) perm) arr
-  | Just (map_pe, cs, _, BasicOp (Rotate rots rotate_arr), [p], [arr]) <-
-      isMapWithOp pat e,
-    paramName p == rotate_arr,
-    not $ UT.isConsumed (patElemName map_pe) used =
-      Simplify . certifying (stmAuxCerts aux1 <> cs) . letBind pat . BasicOp $
-        Rotate (intConst Int64 0 : rots) arr
 mapOpToOp _ _ _ _ = Skip
 
 isMapWithOp ::
@@ -696,7 +690,6 @@ simplifyKnownIterationSOAC _ _ _ _ = Skip
 data ArrayOp
   = ArrayIndexing Certs VName (Slice SubExp)
   | ArrayRearrange Certs VName [Int]
-  | ArrayRotate Certs VName [SubExp]
   | ArrayReshape Certs VName ReshapeKind Shape
   | ArrayCopy Certs VName
   | -- | Never constructed.
@@ -706,7 +699,6 @@ data ArrayOp
 arrayOpArr :: ArrayOp -> VName
 arrayOpArr (ArrayIndexing _ arr _) = arr
 arrayOpArr (ArrayRearrange _ arr _) = arr
-arrayOpArr (ArrayRotate _ arr _) = arr
 arrayOpArr (ArrayReshape _ arr _ _) = arr
 arrayOpArr (ArrayCopy _ arr) = arr
 arrayOpArr (ArrayVar _ arr) = arr
@@ -714,7 +706,6 @@ arrayOpArr (ArrayVar _ arr) = arr
 arrayOpCerts :: ArrayOp -> Certs
 arrayOpCerts (ArrayIndexing cs _ _) = cs
 arrayOpCerts (ArrayRearrange cs _ _) = cs
-arrayOpCerts (ArrayRotate cs _ _) = cs
 arrayOpCerts (ArrayReshape cs _ _ _) = cs
 arrayOpCerts (ArrayCopy cs _) = cs
 arrayOpCerts (ArrayVar cs _) = cs
@@ -724,11 +715,9 @@ isArrayOp cs (BasicOp (Index arr slice)) =
   Just $ ArrayIndexing cs arr slice
 isArrayOp cs (BasicOp (Rearrange perm arr)) =
   Just $ ArrayRearrange cs arr perm
-isArrayOp cs (BasicOp (Rotate rots arr)) =
-  Just $ ArrayRotate cs arr rots
 isArrayOp cs (BasicOp (Reshape k new_shape arr)) =
   Just $ ArrayReshape cs arr k new_shape
-isArrayOp cs (BasicOp (Copy arr)) =
+isArrayOp cs (BasicOp (Replicate (Shape []) (Var arr))) =
   Just $ ArrayCopy cs arr
 isArrayOp _ _ =
   Nothing
@@ -736,9 +725,8 @@ isArrayOp _ _ =
 fromArrayOp :: ArrayOp -> (Certs, Exp rep)
 fromArrayOp (ArrayIndexing cs arr slice) = (cs, BasicOp $ Index arr slice)
 fromArrayOp (ArrayRearrange cs arr perm) = (cs, BasicOp $ Rearrange perm arr)
-fromArrayOp (ArrayRotate cs arr rots) = (cs, BasicOp $ Rotate rots arr)
 fromArrayOp (ArrayReshape cs arr k new_shape) = (cs, BasicOp $ Reshape k new_shape arr)
-fromArrayOp (ArrayCopy cs arr) = (cs, BasicOp $ Copy arr)
+fromArrayOp (ArrayCopy cs arr) = (cs, BasicOp $ Replicate mempty $ Var arr)
 fromArrayOp (ArrayVar cs arr) = (cs, BasicOp $ SubExp $ Var arr)
 
 arrayOps ::
@@ -935,9 +923,6 @@ moveTransformToInput vtable screma_pat aux soac@(Screma w arrs (ScremaForm scan 
       arr `elem` map_param_names
         && all (`ST.elem` vtable) (namesToList $ freeIn cs)
         && not (null perm)
-    arrayIsMapParam (_, ArrayRotate cs arr rots) =
-      arr `elem` map_param_names
-        && all (`ST.elem` vtable) (namesToList $ freeIn cs <> freeIn rots)
     arrayIsMapParam (_, ArrayReshape cs arr _ new_shape) =
       arr `elem` map_param_names
         && all (`ST.elem` vtable) (namesToList $ freeIn cs <> freeIn new_shape)
@@ -959,12 +944,10 @@ moveTransformToInput vtable screma_pat aux soac@(Screma w arrs (ScremaForm scan 
                   BasicOp $ Index arr $ Slice $ whole_dim : slice
                 ArrayRearrange _ _ perm ->
                   BasicOp $ Rearrange (0 : map (+ 1) perm) arr
-                ArrayRotate _ _ rots ->
-                  BasicOp $ Rotate (intConst Int64 0 : rots) arr
                 ArrayReshape _ _ k new_shape ->
                   BasicOp $ Reshape k (Shape [w] <> new_shape) arr
                 ArrayCopy {} ->
-                  BasicOp $ Copy arr
+                  BasicOp $ Replicate mempty $ Var arr
                 ArrayVar {} ->
                   BasicOp $ SubExp $ Var arr
           arr_transformed_t <- lookupType arr_transformed

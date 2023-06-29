@@ -184,9 +184,9 @@ hostOnlyFunDefs funs =
 -- include user defined functions that could turn out to be host-only.
 checkFunDef :: FunDef GPU -> Maybe (Set Name)
 checkFunDef fun = do
-  checkFParams (funDefParams fun)
-  checkRetTypes (funDefRetType fun)
-  checkBody (funDefBody fun)
+  checkFParams $ funDefParams fun
+  checkRetTypes $ map fst $ funDefRetType fun
+  checkBody $ funDefBody fun
   where
     hostOnly = Nothing
     ok = Just ()
@@ -249,7 +249,7 @@ analyseConsts hof funs consts =
 analyseFunDef :: HostOnlyFuns -> FunDef GPU -> MigrationTable
 analyseFunDef hof fd =
   let body = funDefBody fd
-      usage = foldl' f [] $ zip (bodyResult body) (funDefRetType fd)
+      usage = foldl' f [] $ zip (bodyResult body) (map fst $ funDefRetType fd)
       stms = bodyStms body
    in analyseStms hof usage stms
   where
@@ -473,15 +473,6 @@ graphStm stm = do
     BasicOp (Rearrange _ arr) -> do
       graphInefficientReturn [] e
       one bs `reuses` arr
-    BasicOp (Rotate _ arr) -> do
-      -- Migrating a Rotate leads to a memory allocation error.
-      --
-      -- TODO: Fix Rotate memory allocation error.
-      --
-      -- Can be replaced with 'graphHostOnly e' to disable migration.
-      -- A fix can be verified by enabling tests/migration/reuse7_rotate.fut
-      graphInefficientReturn [] e
-      one bs `reuses` arr
     -- Expressions with a cost linear to the size of their result arrays are
     -- inefficient to migrate into GPUBody kernels as such kernels are single-
     -- threaded. For sufficiently large arrays the cost may exceed what is saved
@@ -500,9 +491,6 @@ graphStm stm = do
     BasicOp Concat {} ->
       -- Is unlikely to prevent a scalar read as the only SubExp operand in
       -- practice is a computation of host-only size variables.
-      graphHostOnly e
-    BasicOp Copy {} ->
-      -- Only takes an array operand, so cannot directly prevent a scalar read.
       graphHostOnly e
     BasicOp Manifest {} ->
       -- Takes no scalar operands so cannot directly prevent a scalar read.

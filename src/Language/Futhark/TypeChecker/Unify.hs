@@ -260,9 +260,9 @@ dimNotes _ _ = pure mempty
 typeNotes :: (Located a, MonadUnify m) => a -> StructType -> m Notes
 typeNotes ctx =
   fmap mconcat
-    . mapM (dimNotes ctx . flip sizeVar mempty . qualName)
-    . M.keys
-    . unFV
+    . mapM (dimNotes ctx . flip sizeFromName mempty . qualName)
+    . S.toList
+    . fvVars
     . freeInType
 
 typeVarNotes :: MonadUnify m => VName -> m Notes
@@ -414,7 +414,7 @@ unifyWith onDims usage = subunify False
                 | ord' = flipUnifySizes onDims
                 | otherwise = onDims
 
-          unifyTypeArg bcs' (TypeArgDim (SizeExpr d1)) (TypeArgDim (SizeExpr d2)) =
+          unifyTypeArg bcs' (TypeArgDim d1) (TypeArgDim d2) =
             onDims' bcs' (swap ord d1 d2)
           unifyTypeArg bcs' (TypeArgType t) (TypeArgType arg_t) =
             subunify ord bound bcs' t arg_t
@@ -478,6 +478,13 @@ unifyWith onDims usage = subunify False
                     </> "and"
                     </> indent 2 (pretty d2 <> pretty a2)
                     </> "are incompatible regarding consuming their arguments."
+            | uncurry (<) $ swap ord (uniqueness b2) (uniqueness b1) -> do
+                unifyError usage mempty bcs . withIndexLink "unify-return-uniqueness" $
+                  "Return types"
+                    </> indent 2 (pretty d1 <> pretty b1)
+                    </> "and"
+                    </> indent 2 (pretty d2 <> pretty b2)
+                    </> "have incompatible uniqueness."
             | otherwise -> do
                 -- Introduce the existentials as size variables so they
                 -- are subject to unification.  We will remove them again
@@ -517,7 +524,7 @@ unifyWith onDims usage = subunify False
                 case (p1, p2) of
                   (Named p1', Named p2') ->
                     let f v
-                          | v == p2' = Just $ ExpSubst $ sizeVar (qualName p1') mempty
+                          | v == p2' = Just $ ExpSubst $ sizeFromName (qualName p1') mempty
                           | otherwise = Nothing
                      in (b1, applySubst f b2)
                   (_, _) ->
@@ -526,8 +533,8 @@ unifyWith onDims usage = subunify False
               pname (Named x) = Just x
               pname Unnamed = Nothing
         (Array {}, Array {})
-          | Shape (SizeExpr t1_d : _) <- arrayShape t1',
-            Shape (SizeExpr t2_d : _) <- arrayShape t2',
+          | Shape (t1_d : _) <- arrayShape t1',
+            Shape (t2_d : _) <- arrayShape t2',
             Just t1'' <- peelArray 1 t1',
             Just t2'' <- peelArray 1 t2' -> do
               onDims' bcs (swap ord t1_d t2_d)
@@ -709,7 +716,7 @@ linkVarToType onDims usage bound bcs vn lvl tp_unnorm = do
           | all (`M.member` tp_fields) $ M.keys required_fields -> do
               required_fields' <- mapM normTypeFully required_fields
               let tp' = Scalar $ Record $ required_fields <> tp_fields -- Crucially left-biased.
-                  ext = filter (`M.member` (unFV $ freeInType tp')) bound
+                  ext = filter (`S.member` fvVars (freeInType tp')) bound
               modifyConstraints $
                 M.insert vn (lvl, Constraint (RetType ext tp') usage)
               unifySharedFields onDims usage bound bcs required_fields' tp_fields
@@ -751,7 +758,7 @@ linkVarToType onDims usage bound bcs vn lvl tp_unnorm = do
         Scalar (Sum ts)
           | all (`M.member` ts) $ M.keys required_cs -> do
               let tp' = Scalar $ Sum $ required_cs <> ts -- Crucially left-biased.
-                  ext = filter (`M.member` (unFV $ freeInType tp')) bound
+                  ext = filter (`S.member` fvVars (freeInType tp')) bound
               modifyConstraints $
                 M.insert vn (lvl, Constraint (RetType ext tp') usage)
               unifySharedConstructors onDims usage bound bcs required_cs ts
@@ -809,7 +816,7 @@ linkVarToDim ::
 linkVarToDim usage bcs vn lvl e = do
   constraints <- getConstraints
 
-  mapM_ (checkVar constraints) $ M.keys $ unFV $ freeInExp e
+  mapM_ (checkVar constraints) $ fvVars $ freeInExp e
 
   modifyConstraints $ M.insert vn (lvl, Size (Just e) usage)
   where

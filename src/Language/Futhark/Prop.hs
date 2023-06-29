@@ -23,6 +23,7 @@ module Language.Futhark.Prop
     progHoles,
     defaultEntryPoint,
     paramName,
+    anySize,
 
     -- * Queries on expressions
     typeOf,
@@ -59,6 +60,7 @@ module Language.Futhark.Prop
     peelArray,
     stripArray,
     arrayOf,
+    arrayOfWithAliases,
     toStructural,
     toStruct,
     fromStruct,
@@ -77,12 +79,9 @@ module Language.Futhark.Prop
     sortConstrs,
     isTypeParam,
     isSizeParam,
-    combineTypeShapes,
     matchDims,
-    -- | Values of these types are produces by the parser.  They use
-    -- unadorned names and have no type information, apart from that
-    -- which is syntactically required.
-    NoInfo (..),
+
+    -- * Un-typechecked ASTs
     UncheckedType,
     UncheckedTypeExp,
     UncheckedIdent,
@@ -101,7 +100,8 @@ module Language.Futhark.Prop
     UncheckedSpec,
     UncheckedProg,
     UncheckedCase,
-    -- | Type-checked syntactical constructs
+
+    -- * Type-checked ASTs
     Ident,
     DimIndex,
     Slice,
@@ -294,6 +294,7 @@ arrayOf ::
   TypeBase dim as
 arrayOf = arrayOfWithAliases mempty
 
+-- | Like 'arrayOf', but you can pass in aliases of the resulting array.
 arrayOfWithAliases ::
   Monoid as =>
   as ->
@@ -342,54 +343,24 @@ isTypeParam TypeParamDim {} = False
 isSizeParam :: TypeParamBase vn -> Bool
 isSizeParam = not . isTypeParam
 
--- | Combine the shape information of types as much as possible. The first
--- argument is the orignal type and the second is the type of the transformed
--- expression. This is necessary since the original type may contain additional
--- information (e.g., shape restrictions) from the user given annotation.
-combineTypeShapes ::
-  (Monoid as) =>
-  TypeBase Size as ->
-  TypeBase Size as ->
-  TypeBase Size as
-combineTypeShapes (Scalar (Record ts1)) (Scalar (Record ts2))
-  | M.keys ts1 == M.keys ts2 =
-      Scalar $
-        Record $
-          M.map
-            (uncurry combineTypeShapes)
-            (M.intersectionWith (,) ts1 ts2)
-combineTypeShapes (Scalar (Sum cs1)) (Scalar (Sum cs2))
-  | M.keys cs1 == M.keys cs2 =
-      Scalar $
-        Sum $
-          M.map
-            (uncurry $ zipWith combineTypeShapes)
-            (M.intersectionWith (,) cs1 cs2)
-combineTypeShapes (Scalar (Arrow als1 p1 d1 a1 (RetType dims1 b1))) (Scalar (Arrow als2 _p2 _d2 a2 (RetType _ b2))) =
-  Scalar $
-    Arrow
-      (als1 <> als2)
-      p1
-      d1
-      (combineTypeShapes a1 a2)
-      (RetType dims1 (combineTypeShapes b1 b2))
-combineTypeShapes (Scalar (TypeVar als1 u1 v targs1)) (Scalar (TypeVar als2 _ _ targs2)) =
-  Scalar $ TypeVar (als1 <> als2) u1 v $ zipWith f targs1 targs2
-  where
-    f (TypeArgType t1) (TypeArgType t2) = TypeArgType (combineTypeShapes t1 t2)
-    f targ _ = targ
-combineTypeShapes (Array als1 u1 shape1 et1) (Array als2 _u2 _shape2 et2) =
-  arrayOfWithAliases
-    (als1 <> als2)
-    u1
-    shape1
-    (combineTypeShapes (Scalar et1) (Scalar et2) `setAliases` mempty)
-combineTypeShapes _ new_tp = new_tp
-
 -- | The name, if any.
 paramName :: PName -> Maybe VName
 paramName (Named v) = Just v
 paramName Unnamed = Nothing
+
+-- | A special expression representing no known size.  When present in
+-- a type, each instance represents a distinct size.  The type checker
+-- should _never_ produce these - they are a (hopefully temporary)
+-- thing introduced by defunctorisation and monomorphisation.  They
+-- represent a flaw in our implementation.  When they occur in a
+-- return type, they can be replaced with freshly created existential
+-- sizes.  When they occur in parameter types, they can be replaced
+-- with size parameters.
+anySize :: Size
+anySize =
+  -- The definition here is weird to avoid seeing this as a free
+  -- variable.
+  StringLit [65, 78, 89] mempty
 
 -- | Match the dimensions of otherwise assumed-equal types.  The
 -- combining function is also passed the names bound within the type
@@ -518,6 +489,7 @@ typeOf (Project _ _ (Info t) _) = t
 typeOf (Var _ (Info t) _) = t
 typeOf (Hole (Info t) _) = t
 typeOf (Ascript e _ _) = typeOf e
+typeOf (Coerce _ _ (Info t) _) = t
 typeOf (Negate e _) = typeOf e
 typeOf (Not e _) = typeOf e
 typeOf (Update e _ _ _) = typeOf e `setAliases` mempty
@@ -664,12 +636,17 @@ patNames PatLit {} = mempty
 patNames (PatConstr _ _ ps _) = mconcat $ map patNames ps
 patNames (PatAttr _ p _) = patNames p
 
--- | A mapping from names bound in a map to their identifier.
-patternMap :: (Functor f) => PatBase f VName -> M.Map VName (IdentBase f VName)
-patternMap pat =
-  M.fromList $ zip (map identName idents) idents
-  where
-    idents = S.toList $ patIdents pat
+-- | Each name bound in a pattern alongside its type.
+patternMap :: PatBase Info VName -> [(VName, PatType)]
+patternMap (Id v (Info t) _) = [(v, t)]
+patternMap (PatParens p _) = patternMap p
+patternMap (TuplePat pats _) = mconcat $ map patternMap pats
+patternMap (RecordPat fs _) = mconcat $ map (patternMap . snd) fs
+patternMap Wildcard {} = mempty
+patternMap (PatAscription p _ _) = patternMap p
+patternMap PatLit {} = mempty
+patternMap (PatConstr _ _ ps _) = mconcat $ map patternMap ps
+patternMap (PatAttr _ p _) = patternMap p
 
 -- | The type of values bound by the pattern.
 patternType :: PatBase Info VName -> PatType
@@ -756,6 +733,22 @@ intrinsicVar v =
   where
     bad = error $ "findBuiltin: " <> nameToString v
 
+mkBinOp :: Name -> PatType -> Exp -> Exp -> Exp
+mkBinOp op t x y =
+  AppExp
+    ( BinOp
+        (qualName (intrinsicVar op), mempty)
+        (Info t)
+        (x, Info Nothing)
+        (y, Info Nothing)
+        mempty
+    )
+    (Info $ AppRes t [])
+
+mkAdd, mkMul :: Exp -> Exp -> Exp
+mkAdd = mkBinOp "+" $ Scalar $ Prim $ Signed Int64
+mkMul = mkBinOp "*" $ Scalar $ Prim $ Signed Int64
+
 -- | A map of all built-ins.
 intrinsics :: M.Map VName Intrinsic
 intrinsics =
@@ -773,31 +766,18 @@ intrinsics =
                   $ Array
                     ()
                     Nonunique
-                    ( Shape
-                        [ SizeExpr
-                            $ AppExp
-                              ( BinOp
-                                  (findOp "*", mempty)
-                                  sizeBinOpInfo
-                                  (Var (qualName n) (Info i64) mempty, Info (i64, Nothing))
-                                  (Var (qualName m) (Info i64) mempty, Info (i64, Nothing))
-                                  mempty
-                              )
-                            $ Info
-                            $ AppRes i64 []
-                        ]
-                    )
+                    (Shape [size n `mkMul` size m])
                     t_a
               ),
               ( "unflatten",
                 IntrinsicPolyFun
-                  [tp_a, sp_n]
+                  [tp_a, sp_n, sp_m]
                   [ (Observe, Scalar $ Prim $ Signed Int64),
                     (Observe, Scalar $ Prim $ Signed Int64),
-                    (Observe, Array () Nonunique (shape [n]) t_a)
+                    (Observe, Array () Nonunique (Shape [size n `mkMul` size m]) t_a)
                   ]
-                  $ RetType [k, m]
-                  $ Array () Nonunique (shape [k, m]) t_a
+                  $ RetType []
+                  $ Array () Nonunique (shape [n, m]) t_a
               ),
               ( "concat",
                 IntrinsicPolyFun
@@ -807,29 +787,7 @@ intrinsics =
                   ]
                   $ RetType []
                   $ uarray_a
-                  $ Shape
-                    [ SizeExpr
-                        $ AppExp
-                          ( BinOp
-                              (findOp "+", mempty)
-                              sizeBinOpInfo
-                              (Var (qualName n) (Info i64) mempty, Info (i64, Nothing))
-                              (Var (qualName m) (Info i64) mempty, Info (i64, Nothing))
-                              mempty
-                          )
-                        $ Info
-                        $ AppRes i64 []
-                    ]
-              ),
-              ( "rotate",
-                IntrinsicPolyFun
-                  [tp_a, sp_n]
-                  [ (Observe, Scalar $ Prim $ Signed Int64),
-                    (Observe, array_a $ shape [n])
-                  ]
-                  $ RetType []
-                  $ array_a
-                  $ shape [n]
+                  $ Shape [size n `mkAdd` size m]
               ),
               ( "transpose",
                 IntrinsicPolyFun
@@ -1181,11 +1139,6 @@ intrinsics =
 
     intrinsicStart = 1 + baseTag (fst $ last primOp)
 
-    findOp op =
-      qualName $ maybe bad fst $ find ((op ==) . baseString . fst) primOp
-      where
-        bad = error $ "Intrinsics making, findOp: \"" <> op <> "\""
-
     [a, b, n, m, k, l, p, q] = zipWith VName (map nameFromString ["a", "b", "n", "m", "k", "l", "p", "q"]) [0 ..]
 
     t_a = TypeVar () Nonunique (qualName a) []
@@ -1200,21 +1153,11 @@ intrinsics =
 
     [sp_n, sp_m, sp_k, sp_l, sp_p, sp_q] = map (`TypeParamDim` mempty) [n, m, k, l, p, q]
 
-    shape =
-      Shape
-        . map
-          (flip sizeFromName mempty . qualName)
-
-    i64 = Scalar $ Prim $ Signed Int64
-
-    sizeBinOpInfo = Info $ foldFunType [(Observe, i64), (Observe, i64)] $ RetType [] i64
+    size = flip sizeFromName mempty . qualName
+    shape = Shape . map size
 
     tuple_arr x y s =
-      Array
-        ()
-        Nonunique
-        s
-        (Record (M.fromList $ zip tupleFieldNames [x, y]))
+      Array () Nonunique s (Record (M.fromList $ zip tupleFieldNames [x, y]))
     tuple_uarray x y s = tuple_arr x y s `setUniqueness` Unique
 
     arr x y = Scalar $ Arrow mempty Unnamed Observe x (RetType [] y)
@@ -1497,7 +1440,7 @@ similarSlices slice1 slice2
 -- similar, but you can check for that!).  This is the machinery
 -- underlying expresssion unification.
 similarExps :: Exp -> Exp -> Maybe [(Exp, Exp)]
-similarExps e1 e2 | e1 == e2 = Just []
+similarExps e1 e2 | bareExp e1 == bareExp e2 = Just []
 similarExps e1 e2 | Just e1' <- stripExp e1 = similarExps e1' e2
 similarExps e1 e2 | Just e2' <- stripExp e2 = similarExps e1 e2'
 similarExps

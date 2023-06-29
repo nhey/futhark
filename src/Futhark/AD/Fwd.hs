@@ -226,9 +226,6 @@ basicFwd pat aux op = do
       arr_tan <- tangent arr
       arrs_tans <- mapM tangent arrs
       addStm $ Let pat_tan aux $ BasicOp $ Concat d (arr_tan :| arrs_tans) w
-    Copy arr -> do
-      arr_tan <- tangent arr
-      addStm $ Let pat_tan aux $ BasicOp $ Copy arr_tan
     Manifest ds arr -> do
       arr_tan <- tangent arr
       addStm $ Let pat_tan aux $ BasicOp $ Manifest ds arr_tan
@@ -245,9 +242,6 @@ basicFwd pat aux op = do
     Rearrange perm arr -> do
       arr_tan <- tangent arr
       addStm $ Let pat_tan aux $ BasicOp $ Rearrange perm arr_tan
-    Rotate rots arr -> do
-      arr_tan <- tangent arr
-      addStm $ Let pat_tan aux $ BasicOp $ Rotate rots arr_tan
     _ -> error $ "basicFwd: Unsupported op " ++ prettyString op
 
 fwdLambda :: Lambda SOACS -> ADM (Lambda SOACS)

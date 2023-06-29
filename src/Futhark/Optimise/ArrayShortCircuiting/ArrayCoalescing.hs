@@ -1219,7 +1219,7 @@ mkCoalsTabStm lutab stm@(Let pat _ e) td_env bu_env = do
                   --       @ ... use of b ...  @
                   --       @let c = alias b    @ <- currently fails
                   --       @let y[i] = x       @
-                  -- where @alias@ can be @transpose@, @slice@, @rotate@, @reshape@.
+                  -- where @alias@ can be @transpose@, @slice@, @reshape@.
                   -- We use getTransitiveAlias helper function to track the aliasing
                   --    through the td_env, and to find the updated ixfun of @b@:
                   case getDirAliasedIxfn td_env a_acc b of
@@ -1529,7 +1529,7 @@ genCoalStmtInfo ::
   Stm (Aliases rep) ->
   ShortCircuitM rep (Maybe [SSPointInfo])
 -- CASE a) @let x <- copy(b^{lu})@
-genCoalStmtInfo lutab _ scopetab (Let pat aux (BasicOp (Copy b)))
+genCoalStmtInfo lutab _ scopetab (Let pat aux (BasicOp (Replicate (Shape []) (Var b))))
   | Pat [PatElem x (_, MemArray _ _ _ (ArrayIn m_x ind_x))] <- pat =
       pure $ case (M.lookup x lutab, getScopeMemInfo b scopetab) of
         (Just last_uses, Just (MemBlock tpb shpb m_b ind_b)) ->

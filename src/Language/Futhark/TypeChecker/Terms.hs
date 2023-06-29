@@ -15,6 +15,7 @@ where
 
 import Control.Monad
 import Control.Monad.Except
+import Control.Monad.Identity
 import Control.Monad.Reader
 import Control.Monad.State
 import Data.Bifunctor
@@ -26,7 +27,7 @@ import Data.List.NonEmpty qualified as NE
 import Data.Map.Strict qualified as M
 import Data.Maybe
 import Data.Set qualified as S
-import Futhark.Util (mapAccumLM)
+import Futhark.Util (mapAccumLM, topologicalSort)
 import Futhark.Util.Pretty hiding (space)
 import Language.Futhark
 import Language.Futhark.Primitive (intByteSize)
@@ -140,14 +141,14 @@ sliceShape r slice t@(Array als u (Shape orig_dims) et) =
       | refine_sizes,
         maybe True ((== Just 0) . isInt64) i,
         maybe True ((== Just 1) . isInt64) stride =
-          let j' = maybe d SizeExpr j
+          let j' = fromMaybe d j
            in warnIfConsumingOrBinding mOcc (maybe False hasBinding j) d i j stride j'
                 <*> adjustDims idxes' dims
     adjustDims ((DimSlice i j stride, mOcc) : idxes') (d : dims)
       | refine_sizes,
         Just i' <- i, -- if i ~ 0, previous case
         maybe True ((== Just 1) . isInt64) stride =
-          let j' = fromMaybe (unSizeExpr d) j
+          let j' = fromMaybe d j
            in warnIfConsumingOrBinding mOcc (hasBinding j' || hasBinding i') d i j stride (sizeMinus j' i')
                 <*> adjustDims idxes' dims
     -- stride == -1
@@ -167,21 +168,18 @@ sliceShape r slice t@(Array als u (Shape orig_dims) et) =
       pure dims
 
     sizeMinus j i =
-      SizeExpr
-        $ AppExp
-          ( BinOp
-              (qualName (intrinsicVar "-"), mempty)
-              sizeBinOpInfo
-              (j, Info (i64, Nothing))
-              (i, Info (i64, Nothing))
-              mempty
-          )
+      AppExp
+        ( BinOp
+            (qualName (intrinsicVar "-"), mempty)
+            sizeBinOpInfo
+            (j, Info Nothing)
+            (i, Info Nothing)
+            mempty
+        )
         $ Info
         $ AppRes i64 []
     i64 = Scalar $ Prim $ Signed Int64
     sizeBinOpInfo = Info $ foldFunType [(Observe, i64), (Observe, i64)] $ RetType [] i64
-    unSizeExpr (SizeExpr e) = e
-    unSizeExpr AnySize {} = error "unSizeExpr: AnySize"
 sliceShape _ _ t = pure (t, [])
 
 --- Main checkers
@@ -197,7 +195,6 @@ lexicalClosure params closure = do
         Just OverloadedF {} -> True
         Just (BoundV Local _ _) -> False
         Just (BoundV Nonlocal _ _) -> False
-        Just WasConsumed {} -> False
         Nothing -> False
   pure . S.map AliasBound . S.filter (not . isGlobal) $
     allOccurring closure S.\\ mconcat (map patNames params)
@@ -251,7 +248,7 @@ checkCoerce loc te e = do
   where
     makeNonExtFresh ext = bitraverse onDim pure
       where
-        onDim d@(SizeExpr (Var v _ _))
+        onDim d@(Var v _ _)
           | qualLeaf v `elem` ext = pure d
         onDim d = do
           v <- newTypeName "coerce"
@@ -267,65 +264,80 @@ sizeFree ::
   TypeBase Size as ->
   TermTypeM (TypeBase Size as, [VName])
 sizeFree tloc expKiller orig_t = do
-  scope <- asks termScope
-  (orig_t', m) <- runStateT (onType (M.keysSet $ scopeVtable scope) orig_t) mempty
-  pure (orig_t', M.elems m)
+  runReaderT (to_be_replaced orig_t $ onType orig_t) mempty `runStateT` mempty
   where
-    -- using StateT (M.Map Exp VName) TermTypeM a
-    onScalar scope (Record fs) =
-      Record <$> traverse (onType scope) fs
-    onScalar scope (Sum cs) =
-      Sum <$> (traverse . traverse) (onType scope) cs
-    onScalar scope (Arrow as argName d argT (RetType dims retT)) = do
-      argT' <- onType scope argT
-      retT' <- onType (scope `S.union` argset) retT
-      rl <-
-        state . M.partitionWithKey $
-          const . not . S.disjoint intros . fvVars . freeInExp . unSizeExpr
-      let dims' = dims <> M.elems rl
-      pure $ Arrow as argName d argT' (RetType dims' retT')
+    same_exp e1 e2
+      | Just es <- similarExps e1 e2 =
+          all (uncurry same_exp) es
+      | otherwise = False
+
+    witnessed_exps t = execState (traverseDims onDim t) mempty
       where
-        -- to check : completeness of the filter
-        intros = argset `S.difference` scope
-        argset =
-          fvVars (freeInType argT)
-            <> case argName of
-              Unnamed -> mempty
-              Named vn -> S.singleton vn
-    onScalar scope (TypeVar as u v args) =
+        onDim _ PosImmediate e = modify (e :)
+        onDim _ _ _ = pure ()
+    subExps e
+      | Just e' <- stripExp e = subExps e'
+      | otherwise = astMap mapper e `execState` mempty
+      where
+        mapOnExp e'
+          | Just e'' <- stripExp e' = mapOnExp e''
+          | otherwise = do
+              modify (e' :)
+              astMap mapper e'
+        mapper = identityMapper {mapOnExp}
+    depends a b = any (same_exp b) $ subExps a
+    top_wit =
+      topologicalSort depends . witnessed_exps
+
+    lookReplacement e repl = snd <$> find (same_exp e . fst) repl
+    expReplace mapping e
+      | Just e' <- lookReplacement e mapping = e'
+      | otherwise = runIdentity $ astMap mapper e
+      where
+        mapper = identityMapper {mapOnExp = pure . expReplace mapping}
+
+    -- using ReaderT [(Exp, Exp)] (StateT [VName] TermTypeM) a
+    replacing e = do
+      e' <- asks (`expReplace` e)
+      case expKiller e' of
+        Nothing -> pure e'
+        Just cause -> do
+          vn <- lift $ lift $ newRigidDim tloc (RigidOutOfScope (srclocOf e) cause) "d"
+          modify (vn :)
+          pure $ sizeFromName (qualName vn) (srclocOf e)
+
+    to_be_replaced t m' = do
+      foldl f m' $ top_wit t
+      where
+        f m e = do
+          e' <- replacing e
+          local ((e, e') :) m
+
+    onScalar (Record fs) =
+      Record <$> traverse onType fs
+    onScalar (Sum cs) =
+      Sum <$> (traverse . traverse) onType cs
+    onScalar (Arrow as argName d argT (RetType dims retT)) = do
+      argT' <- onType argT
+      old_bound <- get
+      retT' <- to_be_replaced retT $ onType retT
+      rl <- state $ partition (`notElem` old_bound)
+      let dims' = dims <> rl
+      pure $ Arrow as argName d argT' (RetType dims' retT')
+    onScalar (TypeVar as u v args) =
       TypeVar as u v <$> mapM onTypeArg args
       where
-        onTypeArg (TypeArgDim d) = TypeArgDim <$> onSize d
-        onTypeArg (TypeArgType ty) = TypeArgType <$> onType scope ty
-    onScalar _ (Prim pt) = pure $ Prim pt
-
-    unSizeExpr (SizeExpr e) = e
-    unSizeExpr AnySize {} = error "unSizeExpr: AnySize"
+        onTypeArg (TypeArgDim d) = TypeArgDim <$> replacing d
+        onTypeArg (TypeArgType ty) = TypeArgType <$> onType ty
+    onScalar (Prim pt) = pure $ Prim pt
 
     onType ::
-      S.Set VName ->
       TypeBase Size as ->
-      StateT (M.Map Size VName) TermTypeM (TypeBase Size as) -- Precise the typing, else haskell refuse it
-    onType scope (Array as u shape scalar) =
-      Array as u <$> traverse onSize shape <*> onScalar scope scalar
-    onType scope (Scalar ty) =
-      Scalar <$> onScalar scope ty
-
-    onSize (SizeExpr e) = onExp e
-    onSize AnySize {} = error "onSize: AnySize"
-
-    onExp e = do
-      let e' = SizeExpr e
-      prev <- gets $ M.lookup e'
-      case prev of
-        Just vn -> pure $ sizeFromName (qualName vn) (srclocOf e)
-        Nothing -> do
-          case expKiller e of
-            Nothing -> pure $ SizeExpr e
-            Just cause -> do
-              vn <- lift $ newRigidDim tloc (RigidOutOfScope (srclocOf e) cause) "d"
-              modify $ M.insert (SizeExpr e) vn
-              pure $ sizeFromName (qualName vn) (srclocOf e)
+      ReaderT [(Exp, Exp)] (StateT [VName] TermTypeM) (TypeBase Size as) -- Precise the typing, else haskell refuse it
+    onType (Array as u shape scalar) =
+      Array as u <$> traverse replacing shape <*> onScalar scalar
+    onType (Scalar ty) =
+      Scalar <$> onScalar ty
 
 -- Used to remove unknown sizes from function body types before we
 -- perform let-generalisation.  This is because if a function is
@@ -401,11 +413,11 @@ reboundI64 tloc unscoped =
       | vn `S.member` unscoped = do
           prev <- gets $ M.lookup vn
           case prev of
-            Just vn' -> pure $ sizeVar (qualName vn') loc
+            Just vn' -> pure $ sizeFromName (qualName vn') loc
             Nothing -> do
               vn' <- lift $ newRigidDim tloc (RigidOutOfScope loc vn) "d"
               modify $ M.insert vn vn'
-              pure $ sizeVar (qualName vn') loc
+              pure $ sizeFromName (qualName vn') loc
     mapOnExp e = astMap mapper e
 
 checkExp :: UncheckedExp -> TermTypeM Exp
@@ -513,16 +525,20 @@ checkExp (AppExp (Range start maybe_step end loc) _) = do
     case (isInt64 start', isInt64 <$> maybe_step', end') of
       (Just 0, Just (Just 1), UpToExclusive end'')
         | Scalar (Prim (Signed Int64)) <- end_t ->
-            warnIfConsumingOrBinding (hasBinding end'') $ SizeExpr end''
+            warnIfConsumingOrBinding (hasBinding end'') end''
       (Just 0, Nothing, UpToExclusive end'')
         | Scalar (Prim (Signed Int64)) <- end_t ->
-            warnIfConsumingOrBinding (hasBinding end'') $ SizeExpr end''
+            warnIfConsumingOrBinding (hasBinding end'') end''
       (_, Nothing, UpToExclusive end'')
         | Scalar (Prim (Signed Int64)) <- end_t ->
             warnIfConsumingOrBinding (hasBinding end'' || hasBinding start') $ sizeMinus end'' start'
+      (_, Nothing, ToInclusive end'')
+        -- No stride means we assume a stride of one.
+        | Scalar (Prim (Signed Int64)) <- end_t ->
+            warnIfConsumingOrBinding (hasBinding end'' || hasBinding start') $ sizeMinusInc end'' start'
       (Just 1, Just (Just 2), ToInclusive end'')
         | Scalar (Prim (Signed Int64)) <- end_t ->
-            warnIfConsumingOrBinding (hasBinding end'') $ SizeExpr end''
+            warnIfConsumingOrBinding (hasBinding end'') end''
       _ -> do
         d <- newRigidDim loc RigidRange "range_dim"
         pure (sizeFromName (qualName d) mempty, Just d)
@@ -532,28 +548,30 @@ checkExp (AppExp (Range start maybe_step end loc) _) = do
 
   pure $ AppExp (Range start' maybe_step' end' loc) (Info res)
   where
-    sizeMinus j i =
-      SizeExpr
-        $ AppExp
-          ( BinOp
-              (qualName (intrinsicVar "-"), mempty)
-              sizeBinOpInfo
-              (j, Info (i64, Nothing))
-              (i, Info (i64, Nothing))
-              mempty
-          )
-        $ Info
-        $ AppRes i64 []
     i64 = Scalar $ Prim $ Signed Int64
+    mkBinOp op t x y =
+      AppExp
+        ( BinOp
+            (qualName (intrinsicVar op), mempty)
+            sizeBinOpInfo
+            (x, Info Nothing)
+            (y, Info Nothing)
+            mempty
+        )
+        (Info $ AppRes t [])
+    mkSub = mkBinOp "-" i64
+    mkAdd = mkBinOp "+" i64
+    sizeMinus j i = j `mkSub` i
+    sizeMinusInc j i = (j `mkSub` i) `mkAdd` sizeFromInteger 1 mempty
     sizeBinOpInfo = Info $ foldFunType [(Observe, i64), (Observe, i64)] $ RetType [] i64
 checkExp (Ascript e te loc) = do
   (te', e') <- checkAscript loc te e
   pure $ Ascript e' te' loc
-checkExp (AppExp (Coerce e te loc) _) = do
+checkExp (Coerce e te NoInfo loc) = do
   (te', te_t, e') <- checkCoerce loc te e
   t <- expTypeFully e'
   t' <- matchDims (const . const pure) t $ fromStruct te_t
-  pure $ AppExp (Coerce e' te' loc) (Info $ AppRes t' [])
+  pure $ Coerce e' te' (Info t') loc
 checkExp (AppExp (BinOp (op, oploc) NoInfo (e1, _) (e2, _) loc) NoInfo) = do
   (op', ftype) <- lookupVar oploc op
   e1_arg <- checkArg e1
@@ -561,16 +579,16 @@ checkExp (AppExp (BinOp (op, oploc) NoInfo (e1, _) (e2, _) loc) NoInfo) = do
 
   -- Note that the application to the first operand cannot fix any
   -- existential sizes, because it must by necessity be a function.
-  (_, p1_t, rt, p1_ext, _) <- checkApply loc (Just op', 0) ftype e1_arg
-  (_, p2_t, rt', p2_ext, retext) <- checkApply loc (Just op', 1) rt e2_arg
+  (_, _, rt, p1_ext, _) <- checkApply loc (Just op', 0) ftype e1_arg
+  (_, _, rt', p2_ext, retext) <- checkApply loc (Just op', 1) rt e2_arg
 
   pure $
     AppExp
       ( BinOp
           (op', oploc)
           (Info ftype)
-          (argExp e1_arg, Info (toStruct p1_t, p1_ext))
-          (argExp e2_arg, Info (toStruct p2_t, p2_ext))
+          (argExp e1_arg, Info p1_ext)
+          (argExp e2_arg, Info p2_ext)
           loc
       )
       (Info (AppRes rt' retext))
@@ -744,7 +762,8 @@ checkExp (AppExp (LetWith dest src slice ve body loc) _) =
         badLetWithValue src ve loc
 
       bindingIdent dest (src_t `setAliases` S.empty) $ \dest' -> do
-        body' <- consuming src' $ checkExp body
+        consume (srclocOf src) $ aliases src_t
+        body' <- checkExp body
         (body_t, ext) <-
           unscopePatType loc (S.singleton (identName dest'))
             =<< expTypeFully body'
@@ -1065,7 +1084,7 @@ instantiateDimsInReturnType ::
   TermTypeM (TypeBase Size als, [VName])
 instantiateDimsInReturnType loc fname (RetType dims t) = do
   dims' <- mapM new dims
-  pure (first (onDim $ zip dims $ map (ExpSubst . (`sizeVar` loc) . qualName) dims') t, dims')
+  pure (first (onDim $ zip dims $ map (ExpSubst . (`sizeFromName` loc) . qualName) dims') t, dims')
   where
     new =
       newRigidDim loc (RigidRet fname)
@@ -1101,9 +1120,9 @@ boundInsideType (Scalar (Arrow _ pn _ t1 (RetType dims t2))) =
 dimUses :: StructType -> (Names, Names)
 dimUses = flip execState mempty . traverseDims f
   where
-    f bound _ (SizeExpr (Var v _ _)) | qualLeaf v `S.member` bound = pure ()
-    f _ PosImmediate (SizeExpr (Var v _ _)) = modify ((S.singleton (qualLeaf v), mempty) <>)
-    f _ PosParam (SizeExpr (Var v _ _)) = modify ((mempty, S.singleton (qualLeaf v)) <>)
+    f bound _ (Var v _ _) | qualLeaf v `S.member` bound = pure ()
+    f _ PosImmediate (Var v _ _) = modify ((S.singleton (qualLeaf v), mempty) <>)
+    f _ PosParam (Var v _ _) = modify ((mempty, S.singleton (qualLeaf v)) <>)
     f _ _ _ = pure ()
 
 checkApply ::
@@ -1148,15 +1167,10 @@ checkApply
       checkIfConsumable loc $ mconcat arg_consumed
       occur $ dflow `seqOccurrences` map (`consumption` argloc) arg_consumed
 
-      -- Unification ignores uniqueness in higher-order arguments, so
-      -- we check for that here.
-      unless (toStructural argtype' `subtypeOf` setUniqueness (toStructural tp1') Nonunique) $
-        typeError loc mempty "Difference in whether argument is consumed."
-
       (argext, parsubst) <-
         case pname of
           Named pname'
-            | M.member pname' (unFV $ freeInType tp2') ->
+            | S.member pname' (fvVars $ freeInType tp2') ->
                 case (isJust (anyConsumption dflow), hasBinding argexp) of
                   (True, _) -> do
                     warn (srclocOf argexp) $
@@ -1166,7 +1180,7 @@ checkApply
                     d <- newRigidDim argexp (RigidArg fname $ prettyTextOneLine $ bareExp argexp) "n"
                     pure
                       ( Just d,
-                        (`M.lookup` M.singleton pname' (ExpSubst $ sizeVar (qualName d) $ srclocOf argexp))
+                        (`M.lookup` M.singleton pname' (ExpSubst $ sizeFromName (qualName d) $ srclocOf argexp))
                       )
                   (_, True) -> do
                     warn (srclocOf argexp) $
@@ -1176,7 +1190,7 @@ checkApply
                     d <- newRigidDim argexp (RigidArg fname $ prettyTextOneLine $ bareExp argexp) "n"
                     pure
                       ( Just d,
-                        (`M.lookup` M.singleton pname' (ExpSubst $ sizeVar (qualName d) $ srclocOf argexp))
+                        (`M.lookup` M.singleton pname' (ExpSubst $ sizeFromName (qualName d) $ srclocOf argexp))
                       )
                   (False, False) ->
                     -- We strip the argument expression to make it
@@ -1289,15 +1303,14 @@ causalityCheck binding_body = do
   let checkCausality what known t loc
         | (d, dloc) : _ <-
             mapMaybe (unknown constraints known) $
-              M.keys $
-                unFV $
-                  freeInType $
-                    toStruct t =
+              S.toList (fvVars $ freeInType $ toStruct t) =
             Just $ lift $ causality what (locOf loc) d dloc t
         | otherwise = Nothing
 
       checkParamCausality known p =
         checkCausality (pretty p) known (patternType p) (locOf p)
+
+      collectingNewKnown = lift . flip execStateT mempty
 
       onExp ::
         S.Set VName ->
@@ -1325,14 +1338,19 @@ causalityCheck binding_body = do
       onExp known (Hole (Info t) loc)
         | Just bad <- checkCausality "hole" known t loc =
             bad
-      onExp known (Lambda params _ _ _ _)
+      onExp known e@(Lambda params body _ _ _)
         | bad : _ <- mapMaybe (checkParamCausality known) params =
             bad
+        | otherwise = do
+            -- Existentials coming into existence in the lambda body
+            -- are not known outside of it.
+            void $ collectingNewKnown $ onExp known body
+            pure e
       onExp known e@(AppExp (LetPat _ _ bindee_e body_e _) (Info res)) = do
         sequencePoint known bindee_e body_e $ appResExt res
         pure e
       onExp known e@(AppExp (Match scrutinee cs _) (Info res)) = do
-        new_known <- lift $ execStateT (onExp known scrutinee) mempty
+        new_known <- collectingNewKnown $ onExp known scrutinee
         void $ recurse (new_known <> known) cs
         modify ((new_known <> S.fromList (appResExt res)) <>)
         pure e
@@ -1344,15 +1362,27 @@ causalityCheck binding_body = do
             void $ onExp known' f
             modify (S.fromList (appResExt res) <>)
           seqArgs known' ((Info (_, p), x) : xs) = do
-            new_known <- lift $ execStateT (onExp known' x) mempty
+            new_known <- collectingNewKnown $ onExp known' x
             void $ seqArgs (new_known <> known') xs
             modify ((new_known <> S.fromList (maybeToList p)) <>)
+      onExp known e@(Constr v args (Info t) loc) = do
+        seqArgs known args
+        pure e
+        where
+          seqArgs known' []
+            | Just bad <- checkCausality (dquotes ("#" <> pretty v)) known' t loc =
+                bad
+            | otherwise =
+                pure ()
+          seqArgs known' (x : xs) = do
+            new_known <- collectingNewKnown $ onExp known' x
+            void $ seqArgs (new_known <> known') xs
+            modify (new_known <>)
       onExp
         known
-        e@(AppExp (BinOp (f, floc) ft (x, Info (_, xp)) (y, Info (_, yp)) _) (Info res)) = do
+        e@(AppExp (BinOp (f, floc) ft (x, Info xp) (y, Info yp) _) (Info res)) = do
           args_known <-
-            lift $
-              execStateT (sequencePoint known x y $ catMaybes [xp, yp]) mempty
+            collectingNewKnown $ sequencePoint known x y $ catMaybes [xp, yp]
           void $ onExp (args_known <> known) (Var f ft floc)
           modify ((args_known <> S.fromList (appResExt res)) <>)
           pure e
@@ -1369,7 +1399,7 @@ causalityCheck binding_body = do
           mapper = identityMapper {mapOnExp = onExp known}
 
       sequencePoint known x y ext = do
-        new_known <- lift $ execStateT (onExp known x) mempty
+        new_known <- collectingNewKnown $ onExp known x
         void $ onExp (new_known <> known) y
         modify ((new_known <> S.fromList ext) <>)
 
@@ -1386,14 +1416,14 @@ causalityCheck binding_body = do
     causality what loc d dloc t =
       Left . TypeError loc mempty . withIndexLink "causality-check" $
         "Causality check: size"
-          </> dquotes (prettyName d)
+          <+> dquotes (prettyName d)
           <+> "needed for type of"
           <+> what <> colon
           </> indent 2 (pretty t)
           </> "But"
           <+> dquotes (prettyName d)
           <+> "is computed at"
-          </> pretty (locStrRel loc dloc) <> "."
+          <+> pretty (locStrRel loc dloc) <> "."
           </> ""
           </> "Hint:"
           <+> align
@@ -1432,8 +1462,9 @@ localChecks = void . check
       e <$ case ty of
         Info (Scalar (Prim t)) -> errorBounds (inBoundsI (-x) t) (-x) t (loc1 <> loc2)
         _ -> error "Inferred type of int literal is not a number"
-    check e@(AppExp (BinOp (QualName [] v, _) _ (_, Info (Array {}, _)) _ loc) _)
+    check e@(AppExp (BinOp (QualName [] v, _) _ (x, _) _ loc) _)
       | baseName v == "==",
+        Array {} <- typeOf x,
         baseTag v <= maxIntrinsicTag = do
           warn loc $
             textwrap
@@ -1589,7 +1620,7 @@ inferredReturnType loc params t = do
     unscopePatType loc hidden_params $
       inferReturnUniqueness params t
   where
-    hidden_params = M.keysSet $ M.filterWithKey (const . (`S.member` hidden)) $ foldMap patternMap params
+    hidden_params = S.filter (`S.member` hidden) $ foldMap patNames params
     hidden = hiddenParamNames params
 
 checkReturnAlias :: SrcLoc -> TypeBase () () -> [Pat] -> PatType -> TermTypeM ()
@@ -1697,7 +1728,7 @@ sizeNamesPos (Scalar (Arrow _ _ _ t1 (RetType _ t2))) = onParam t1 <> sizeNamesP
     onParam (Scalar (Record fs)) = mconcat $ map onParam $ M.elems fs
     onParam (Scalar (TypeVar _ _ _ targs)) = mconcat $ map onTypeArg targs
     onParam t = fvVars $ freeInType t
-    onTypeArg (TypeArgDim (SizeExpr (Var d _ _))) = S.singleton $ qualLeaf d
+    onTypeArg (TypeArgDim (Var d _ _)) = S.singleton $ qualLeaf d
     onTypeArg (TypeArgDim _) = mempty
     onTypeArg (TypeArgType t) = onParam t
 sizeNamesPos _ = mempty
@@ -1859,7 +1890,7 @@ closeOverTypes defname defloc tparams paramts ret substs = do
           _ -> Nothing
   pure
     ( tparams ++ more_tparams,
-      injectExt (retext ++ mapMaybe mkExt (M.keys $ unFV $ freeInType ret)) ret
+      injectExt (retext ++ mapMaybe mkExt (S.toList $ fvVars $ freeInType ret)) ret
     )
   where
     -- Diet does not matter here.
@@ -1882,7 +1913,7 @@ closeOverTypes defname defloc tparams paramts ret substs = do
     closeOver (k, UnknownSize _ _)
       | k `S.member` param_sizes,
         k `S.notMember` produced_sizes = do
-          notes <- dimNotes defloc $ sizeVar (qualName k) mempty
+          notes <- dimNotes defloc $ sizeFromName (qualName k) mempty
           typeError defloc notes . withIndexLink "unknown-param-def" $
             "Unknown size"
               <+> dquotes (prettyName k)
@@ -1939,7 +1970,7 @@ letGeneralise defname defloc tparams params rettype =
 
     let used_sizes =
           foldMap freeInType $ rettype'' : map patternStructType params
-    case filter ((`M.notMember` unFV used_sizes) . typeParamName) $
+    case filter ((`S.notMember` fvVars used_sizes) . typeParamName) $
       filter isSizeParam tparams' of
       [] -> pure ()
       tp : _ -> unusedSize $ SizeBinder (typeParamName tp) (srclocOf tp)
@@ -1957,7 +1988,7 @@ checkFunBody ::
   SrcLoc ->
   TermTypeM Exp
 checkFunBody params body maybe_rettype loc = do
-  body' <- noSizeEscape $ checkExp body
+  body' <- checkExp body
 
   -- Unify body return type with return annotation, if one exists.
   case maybe_rettype of
@@ -1969,10 +2000,7 @@ checkFunBody params body maybe_rettype loc = do
       (body_t', _) <-
         unscopePatType
           loc
-          ( M.keysSet $
-              M.filterWithKey (const . (`S.member` hidden)) $
-                foldMap patternMap params
-          )
+          (S.filter (`S.member` hidden) $ foldMap patNames params)
           body_t
 
       let usage = mkUsage body "return type annotation"

@@ -99,7 +99,7 @@ simplifyConcat (vtable, _) pat _ (Concat i (x :| xs) new_d)
 -- may be produced as a result of other simplification rules.
 simplifyConcat _ pat aux (Concat _ (x :| []) _) =
   -- Still need a copy because Concat produces a fresh array.
-  Simplify $ auxing aux $ letBind pat $ BasicOp $ Copy x
+  Simplify $ auxing aux $ letBind pat $ BasicOp $ Replicate mempty $ Var x
 -- concat xs (concat ys zs) == concat xs ys zs
 simplifyConcat (vtable, _) pat (StmAux cs attrs _) (Concat i (x :| xs) new_d)
   | x' /= x || concat xs' /= xs =
@@ -173,7 +173,7 @@ ruleBasicOp vtable pat aux (Update _ dest destis (Var v))
     arrayFrom e =
       Simplify $ auxing aux $ letBind pat $ BasicOp $ SubExp $ Var dest
   where
-    arrayFrom (BasicOp (Copy copy_v))
+    arrayFrom (BasicOp (Replicate (Shape []) (Var copy_v)))
       | Just (e', _) <- ST.lookupExp copy_v vtable =
           arrayFrom e'
     arrayFrom (BasicOp (Index src srcis)) =
@@ -191,13 +191,13 @@ ruleBasicOp vtable pat aux (Update Unsafe dest is se)
       case se of
         Var v | not $ null $ sliceDims is -> do
           v_reshaped <-
-            letExp (baseString v ++ "_reshaped") . BasicOp $
+            letSubExp (baseString v ++ "_reshaped") . BasicOp $
               Reshape ReshapeArbitrary (arrayShape dest_t) v
-          letBind pat $ BasicOp $ Copy v_reshaped
+          letBind pat $ BasicOp $ Replicate mempty v_reshaped
         _ -> letBind pat $ BasicOp $ ArrayLit [se] $ rowType dest_t
 ruleBasicOp vtable pat (StmAux cs1 attrs _) (Update safety1 dest1 is1 (Var v1))
   | Just (Update safety2 dest2 is2 se2, cs2) <- ST.lookupBasicOp v1 vtable,
-    Just (Copy v3, cs3) <- ST.lookupBasicOp dest2 vtable,
+    Just (Replicate (Shape []) (Var v3), cs3) <- ST.lookupBasicOp dest2 vtable,
     Just (Index v4 is4, cs4) <- ST.lookupBasicOp v3 vtable,
     is4 == is1,
     v4 == dest1 =
@@ -236,20 +236,17 @@ ruleBasicOp vtable pat _ (CmpOp (CmpEq t) se1 se2)
       fmap snd . find ((== v) . patElemName . fst) $
         zip (patElems ifpat) $
           zip (map resSubExp (bodyResult tbranch)) (map resSubExp (bodyResult fbranch))
-ruleBasicOp _ pat _ (Replicate (Shape []) se@Constant {}) =
-  Simplify $ letBind pat $ BasicOp $ SubExp se
 ruleBasicOp _ pat _ (Replicate _ se)
   | [Acc {}] <- patTypes pat =
       Simplify $ letBind pat $ BasicOp $ SubExp se
-ruleBasicOp _ pat _ (Replicate (Shape []) (Var v)) = Simplify $ do
-  v_t <- lookupType v
-  letBind pat $
-    BasicOp $
-      if primType v_t
-        then SubExp $ Var v
-        else Copy v
+ruleBasicOp _ pat _ (Replicate (Shape []) se) = Simplify $ do
+  se_t <- subExpType se
+  if primType se_t
+    then letBind pat $ BasicOp $ SubExp se
+    else cannotSimplify
 ruleBasicOp vtable pat _ (Replicate shape (Var v))
-  | Just (BasicOp (Replicate shape2 se), cs) <- ST.lookupExp v vtable =
+  | Just (BasicOp (Replicate shape2 se), cs) <- ST.lookupExp v vtable,
+    ST.subExpAvailable se vtable =
       Simplify $ certifying cs $ letBind pat $ BasicOp $ Replicate (shape <> shape2) se
 ruleBasicOp _ pat _ (ArrayLit (se : ses) _)
   | all (== se) ses =
@@ -283,7 +280,7 @@ ruleBasicOp vtable pat aux (Index idd slice)
                       map DimFix new_inds'
 
 -- Copying an iota is pointless; just make it an iota instead.
-ruleBasicOp vtable pat aux (Copy v)
+ruleBasicOp vtable pat aux (Replicate (Shape []) (Var v))
   | Just (Iota n x s it, v_cs) <- ST.lookupBasicOp v vtable =
       Simplify . certifying v_cs . auxing aux $
         letBind pat $
@@ -300,17 +297,6 @@ ruleBasicOp vtable pat aux (Rearrange perm v)
         letBind pat $
           BasicOp $
             Rearrange (perm `rearrangeCompose` perm2) e
-ruleBasicOp vtable pat aux (Rearrange perm v)
-  | Just (BasicOp (Rotate offsets v2), v_cs) <- ST.lookupExp v vtable,
-    Just (BasicOp (Rearrange perm3 v3), v2_cs) <- ST.lookupExp v2 vtable = Simplify $ do
-      let offsets' = rearrangeShape (rearrangeInverse perm3) offsets
-      rearrange_rotate <- letExp "rearrange_rotate" $ BasicOp $ Rotate offsets' v3
-      certifying (v_cs <> v2_cs) $
-        auxing aux $
-          letBind pat $
-            BasicOp $
-              Rearrange (perm `rearrangeCompose` perm3) rearrange_rotate
-
 -- Rearranging a replicate where the outer dimension is left untouched.
 ruleBasicOp vtable pat aux (Rearrange perm v1)
   | Just (BasicOp (Replicate dims (Var v2)), v1_cs) <- ST.lookupExp v1 vtable,
@@ -326,34 +312,6 @@ ruleBasicOp vtable pat aux (Rearrange perm v1)
                 BasicOp $
                   Rearrange (map (subtract num_dims) rest_perm) v2
             letBind pat $ BasicOp $ Replicate dims v
-
--- A zero-rotation is identity.
-ruleBasicOp _ pat _ (Rotate offsets v)
-  | all isCt0 offsets = Simplify $ letBind pat $ BasicOp $ SubExp $ Var v
-ruleBasicOp vtable pat aux (Rotate offsets v)
-  | Just (BasicOp (Rearrange perm v2), v_cs) <- ST.lookupExp v vtable,
-    Just (BasicOp (Rotate offsets2 v3), v2_cs) <- ST.lookupExp v2 vtable = Simplify $ do
-      let offsets2' = rearrangeShape (rearrangeInverse perm) offsets2
-          addOffsets x y = letSubExp "summed_offset" $ BasicOp $ BinOp (Add Int64 OverflowWrap) x y
-      offsets' <- zipWithM addOffsets offsets offsets2'
-      rotate_rearrange <-
-        auxing aux $ letExp "rotate_rearrange" $ BasicOp $ Rearrange perm v3
-      certifying (v_cs <> v2_cs) $
-        letBind pat $
-          BasicOp $
-            Rotate offsets' rotate_rearrange
-
--- Combining Rotates.
-ruleBasicOp vtable pat aux (Rotate offsets1 v)
-  | Just (BasicOp (Rotate offsets2 v2), v_cs) <- ST.lookupExp v vtable = Simplify $ do
-      offsets <- zipWithM add offsets1 offsets2
-      certifying v_cs $
-        auxing aux $
-          letBind pat $
-            BasicOp $
-              Rotate offsets v2
-  where
-    add x y = letSubExp "offset" $ BasicOp $ BinOp (Add Int64 OverflowWrap) x y
 
 -- Simplify away 0<=i when 'i' is from a loop of form 'for i < n'.
 ruleBasicOp vtable pat aux (CmpOp CmpSle {} x y)
@@ -396,7 +354,7 @@ ruleBasicOp vtable pat aux (UpdateAcc acc _ vs)
 -- Manifest of a a copy can be simplified to manifesting the original
 -- array, if it is still available.
 ruleBasicOp vtable pat aux (Manifest perm v1)
-  | Just (Copy v2, cs) <- ST.lookupBasicOp v1 vtable,
+  | Just (Replicate (Shape []) (Var v2), cs) <- ST.lookupBasicOp v1 vtable,
     ST.available v2 vtable =
       Simplify . auxing aux . certifying cs $
         letBind pat $

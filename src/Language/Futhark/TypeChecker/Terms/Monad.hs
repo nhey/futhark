@@ -32,13 +32,10 @@ module Language.Futhark.TypeChecker.Terms.Monad
     unifies,
     require,
     checkTypeExpNonrigid,
-    checkTypeExpRigid,
 
     -- * Sizes
     isInt64,
     maybeDimFromExp,
-    dimFromExp,
-    noSizeEscape,
 
     -- * Control flow
     collectOccurrences,
@@ -56,7 +53,6 @@ module Language.Futhark.TypeChecker.Terms.Monad
     occur,
     observe,
     consume,
-    consuming,
     observation,
     consumption,
     checkIfConsumable,
@@ -217,7 +213,6 @@ data ValBinding
     BoundV Locality [TypeParam] PatType
   | OverloadedF [PrimType] [Maybe PrimType] (Maybe PrimType)
   | EqualityF
-  | WasConsumed SrcLoc
   deriving (Show)
 
 --- Errors
@@ -460,12 +455,6 @@ nameReason loc (NameAppRes fname apploc) =
 data TermTypeState = TermTypeState
   { stateConstraints :: Constraints,
     stateCounter :: !Int,
-    -- | Mapping function arguments encountered to
-    -- the sizes they ended up generating (when
-    -- they could not be substituted directly).
-    -- This happens for function arguments that are
-    -- not constants or names.
-    stateDimTable :: M.Map SizeSource VName,
     stateNames :: M.Map VName NameReason,
     stateOccs :: Occurrences
   }
@@ -582,7 +571,7 @@ instantiateTypeParam qn loc tparam = do
     TypeParamDim {} -> do
       constrain v . Size Nothing . mkUsage loc . docText $
         "instantiated size parameter of " <> dquotes (pretty qn)
-      pure (v, ExpSubst $ sizeVar (qualName v) loc)
+      pure (v, ExpSubst $ sizeFromName (qualName v) loc)
 
 checkQualNameWithEnv :: Namespace -> QualName Name -> SrcLoc -> TermTypeM (TermScope, QualName VName)
 checkQualNameWithEnv space qn@(QualName quals name) loc = do
@@ -678,7 +667,6 @@ instance MonadTypeChecker TermTypeM where
       Nothing ->
         typeError loc mempty $
           "Unknown variable" <+> dquotes (pretty qn) <> "."
-      Just (WasConsumed wloc) -> useAfterConsume name loc wloc
       Just (BoundV _ tparams t)
         | "_" `isPrefixOf` baseString name -> underscoreUse loc qn
         | otherwise -> do
@@ -722,27 +710,18 @@ onFailure c = local $ \env -> env {termChecking = Just c}
 
 extSize :: SrcLoc -> SizeSource -> TermTypeM (Size, Maybe VName)
 extSize loc e = do
-  prev <- gets $ M.lookup e . stateDimTable
-  case prev of
-    Nothing -> do
-      let rsrc = case e of
-            SourceArg (FName fname) e' ->
-              RigidArg fname $ prettyTextOneLine e'
-            SourceBound e' ->
-              RigidBound $ prettyTextOneLine e'
-            SourceSlice d i j s ->
-              RigidSlice d $ prettyTextOneLine $ DimSlice i j s
-      d <- newRigidDim loc rsrc "n"
-      modify $ \s -> s {stateDimTable = M.insert e d $ stateDimTable s}
-      pure
-        ( sizeFromName (qualName d) loc,
-          Just d
-        )
-    Just d ->
-      pure
-        ( sizeFromName (qualName d) loc,
-          Just d
-        )
+  let rsrc = case e of
+        SourceArg (FName fname) e' ->
+          RigidArg fname $ prettyTextOneLine e'
+        SourceBound e' ->
+          RigidBound $ prettyTextOneLine e'
+        SourceSlice d i j s ->
+          RigidSlice d $ prettyTextOneLine $ DimSlice i j s
+  d <- newRigidDim loc rsrc "n"
+  pure
+    ( sizeFromName (qualName d) loc,
+      Just d
+    )
 
 incLevel :: TermTypeM a -> TermTypeM a
 incLevel = local $ \env -> env {termLevel = termLevel env + 1}
@@ -842,16 +821,6 @@ checkTypeExpNonrigid te = do
     constrain v $ Size Nothing $ mkUsage (srclocOf te) "anonymous size in type expression"
   pure (te', st, svars ++ dims)
 
-checkTypeExpRigid ::
-  TypeExp NoInfo Name ->
-  RigidSource ->
-  TermTypeM (TypeExp Info VName, StructType, [VName])
-checkTypeExpRigid te rsrc = do
-  (te', svars, RetType dims st) <- termCheckTypeExp te
-  forM_ (svars ++ dims) $ \v ->
-    constrain v $ UnknownSize (srclocOf te) rsrc
-  pure (te', st, svars ++ dims)
-
 --- Sizes
 
 isInt64 :: Exp -> Maybe Int64
@@ -862,33 +831,10 @@ isInt64 (Parens x _) = isInt64 x
 isInt64 _ = Nothing
 
 maybeDimFromExp :: Exp -> Maybe Size
-maybeDimFromExp (Var v typ loc) = Just $ SizeExpr $ Var v typ loc
+maybeDimFromExp (Var v typ loc) = Just $ Var v typ loc
 maybeDimFromExp (Parens e _) = maybeDimFromExp e
 maybeDimFromExp (QualParens _ e _) = maybeDimFromExp e
 maybeDimFromExp e = flip sizeFromInteger mempty . fromIntegral <$> isInt64 e
-
-dimFromExp :: (Exp -> SizeSource) -> Exp -> TermTypeM (Size, Maybe VName)
-dimFromExp rf (Attr _ e _) = dimFromExp rf e
-dimFromExp rf (Assert _ e _ _) = dimFromExp rf e
-dimFromExp rf (Parens e _) = dimFromExp rf e
-dimFromExp rf (QualParens _ e _) = dimFromExp rf e
-dimFromExp rf e
-  | Just d <- maybeDimFromExp e =
-      pure (d, Nothing)
-  | otherwise =
-      extSize (srclocOf e) $ rf e
-
--- | Any argument sizes created with 'extSize' inside the given action
--- will be removed once the action finishes.  This is to ensure that
--- just because e.g. @n+1@ appears as a size in one branch of a
--- conditional, that doesn't mean it's also available in the other
--- branch.
-noSizeEscape :: TermTypeM a -> TermTypeM a
-noSizeEscape m = do
-  dimtable <- gets stateDimTable
-  x <- m
-  modify $ \s -> s {stateDimTable = dimtable}
-  pure x
 
 --- Control flow
 
@@ -909,8 +855,8 @@ collectOccurrences m = do
 
 alternative :: TermTypeM a -> TermTypeM b -> TermTypeM (a, b)
 alternative m1 m2 = do
-  (x, occurs1) <- collectOccurrences $ noSizeEscape m1
-  (y, occurs2) <- collectOccurrences $ noSizeEscape m2
+  (x, occurs1) <- collectOccurrences m1
+  (y, occurs2) <- collectOccurrences m2
   checkOccurrences occurs1
   checkOccurrences occurs2
   occur $ occurs1 `altOccurrences` occurs2
@@ -948,7 +894,6 @@ noUnique m = do
     set (BoundV l tparams t) = BoundV (max l Nonlocal) tparams t
     set (OverloadedF ts pts rt) = OverloadedF ts pts rt
     set EqualityF = EqualityF
-    set (WasConsumed loc) = WasConsumed loc
 
     split = unzip . map (\occ -> (occ {consumed = mempty}, occ {observed = mempty}))
 
@@ -978,18 +923,6 @@ consume :: SrcLoc -> Aliasing -> TermTypeM ()
 consume loc als = do
   checkIfConsumable loc als
   occur [consumption als loc]
-
--- | Proclaim that we have written to the given variable, and mark
--- accesses to it and all of its aliases as invalid inside the given
--- computation.
-consuming :: Ident -> TermTypeM a -> TermTypeM a
-consuming (Ident name (Info t) loc) m = do
-  t' <- normTypeFully t
-  consume loc $ AliasBound name `S.insert` aliases t'
-  localScope consume' m
-  where
-    consume' scope =
-      scope {scopeVtable = M.insert name (WasConsumed loc) $ scopeVtable scope}
 
 -- Running
 
@@ -1037,4 +970,4 @@ runTermTypeM checker (TermTypeM m) = do
   second stateOccs
     <$> runStateT
       (runReaderT m initial_tenv)
-      (TermTypeState mempty 0 mempty mempty mempty)
+      (TermTypeState mempty 0 mempty mempty)

@@ -94,22 +94,6 @@ simplifyIndexing vtable seType idd (Slice inds) consuming =
               letSubExp "slice_iota" $
                 BasicOp $
                   Iota i_n i_offset'' i_stride'' to_it
-
-    -- A rotate cannot be simplified away if we are slicing a rotated dimension.
-    Just (Rotate offsets a, cs)
-      | not $ or $ zipWith rotateAndSlice offsets inds -> Just $ do
-          dims <- arrayDims <$> lookupType a
-          let adjustI i o d = do
-                i_p_o <- letSubExp "i_p_o" $ BasicOp $ BinOp (Add Int64 OverflowWrap) i o
-                letSubExp "rot_i" (BasicOp $ BinOp (SMod Int64 Unsafe) i_p_o d)
-              adjust (DimFix i, o, d) =
-                DimFix <$> adjustI i o d
-              adjust (DimSlice i n s, o, d) =
-                DimSlice <$> adjustI i o d <*> pure n <*> pure s
-          IndexResult cs a . Slice <$> mapM adjust (zip3 inds offsets dims)
-      where
-        rotateAndSlice r DimSlice {} = not $ isCt0 r
-        rotateAndSlice _ _ = False
     Just (Index aa ais, cs) ->
       Just $
         IndexResult cs aa
@@ -128,7 +112,8 @@ simplifyIndexing vtable seType idd (Slice inds) consuming =
     Just (Replicate (Shape ds) v, cs)
       | (ds_inds, rest_inds) <- splitAt (length ds) inds,
         (ds', ds_inds') <- unzip $ mapMaybe index ds_inds,
-        ds' /= ds ->
+        ds' /= ds,
+        ST.subExpAvailable v vtable ->
           Just $ do
             arr <- letExp "smaller_replicate" $ BasicOp $ Replicate (Shape ds') v
             pure $ IndexResult cs arr $ Slice $ ds_inds' ++ rest_inds
@@ -142,7 +127,7 @@ simplifyIndexing vtable seType idd (Slice inds) consuming =
       where
         isIndex DimFix {} = True
         isIndex _ = False
-    Just (Copy src, cs)
+    Just (Replicate (Shape []) (Var src), cs)
       | Just dims <- arrayDims <$> seType (Var src),
         length inds == length dims,
         -- It is generally not safe to simplify a slice of a copy,
