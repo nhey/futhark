@@ -17,6 +17,7 @@ import Futhark.Tools
 import Futhark.Transform.Rename
 import Futhark.Transform.Substitute
 import Futhark.Util (nubOrd, traverseFold)
+import Debug.Trace
 
 -- | A convenience function to bring the components of a for-loop into
 -- scope and throw an error if the passed 'Exp' is not a for-loop.
@@ -97,10 +98,8 @@ computeWhileIters e = error $ "convertWhileIters: not a while-loop:\n" <> pretty
 -- where @n@ is an upper bound on the number of iterations of the
 -- while-loop. The resulting for-loop will execute for @n@ iterations on
 -- all inputs, so the tighter the bound the better.
-convertWhileLoop :: [SubExp] -> Exp SOACS -> ADM (Exp SOACS)
-convertWhileLoop (bound_se : []) loop@(DoLoop val_pats (WhileLoop _) _) =
-  convertWhileLoop (bound_se : map (Var . paramName . fst) val_pats) loop
-convertWhileLoop (bound_se : result_ses) (DoLoop val_pats (WhileLoop cond) body) =
+convertWhileLoop :: SubExp -> Exp SOACS -> ADM (Exp SOACS)
+convertWhileLoop bound_se (DoLoop val_pats (WhileLoop cond) body) =
   localScope (scopeOfFParams $ map fst val_pats) $ do
     i <- newVName "i"
     body' <-
@@ -108,7 +107,7 @@ convertWhileLoop (bound_se : result_ses) (DoLoop val_pats (WhileLoop cond) body)
         [ eIf
             (pure $ BasicOp $ SubExp $ Var cond)
             (pure body)
-            (resultBodyM result_ses)
+            (resultBodyM $ map (Var . paramName . fst) val_pats)
         ]
     pure $ DoLoop val_pats (ForLoop i Int64 bound_se mempty) body'
 convertWhileLoop _ e = error $ "convertWhileLoop: not a while-loop:\n" <> prettyString e
@@ -444,12 +443,30 @@ diffLoop diffStms pat aux loop m
        in case bounds of
             (bound : _) -> do
               let bound_se = Constant $ IntValue $ intValue Int64 bound
-              for_loop <- convertWhileLoop [bound_se] loop
+              for_loop <- convertWhileLoop bound_se loop
               diffLoop diffStms pat aux for_loop m
             _ -> do
               bound_res <- computeWhileIters loop
-              for_loop <- convertWhileLoop bound_res =<< renameExp loop
-              diffLoop diffStms pat aux for_loop m
+              let bound = head bound_res
+              let res = tail bound_res
+              for_loop <- convertWhileLoop bound =<< renameExp loop
+              -- diffLoop diffStms pat aux for_loop m
+              fwdLoop pat aux for_loop
+              -- Overwrite results of `for_loop` using results from `loop`
+              -- (Essentially change of variable names.)
+              let names = map patElemName $ patElems pat
+              traceM $ show names
+              let m' = forM (zip names res) $ \(n, v) ->
+                        letBindNames [n] $ BasicOp $ SubExp v
+              w <- collectStms m'
+              traceM $ "letBind: " ++ show w
+              _ <- m'
+              -- ^Overwrite results
+              m
+              revLoop diffStms pat for_loop
+              -- TODO Create MVE from driver-knn.fut; too much going on
+              -- to know if adjoint code is actually dead and should be
+              -- eliminated.
   | otherwise = do
       fwdLoop pat aux loop
       m
