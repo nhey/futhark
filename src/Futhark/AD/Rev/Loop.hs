@@ -76,7 +76,7 @@ removeLoopVars loop =
     pure $ DoLoop val_pats form $ Body aux' (subst_stms <> stms') res'
 
 -- | Augments a while-loop to also compute the number of iterations.
-computeWhileIters :: Exp SOACS -> ADM SubExp
+computeWhileIters :: Exp SOACS -> ADM [SubExp]
 computeWhileIters (DoLoop val_pats (WhileLoop b) body) = do
   bound_v <- newVName "bound"
   let t = Prim $ IntType Int64
@@ -89,8 +89,7 @@ computeWhileIters (DoLoop val_pats (WhileLoop b) body) = do
          in letSubExp "bound+1" $ BasicOp $ BinOp (Add Int64 OverflowUndef) (Var bound_v) one
       addStms $ bodyStms body
       pure (pure (subExpRes bound_plus_one) <> bodyResult body)
-  res <- letTupExp' "loop" $ DoLoop ((bound_param, bound_init) : val_pats) (WhileLoop b) body'
-  pure $ head res
+  letTupExp' "loop" $ DoLoop ((bound_param, bound_init) : val_pats) (WhileLoop b) body'
 computeWhileIters e = error $ "convertWhileIters: not a while-loop:\n" <> prettyString e
 
 -- | Converts a 'WhileLoop' into a 'ForLoop'. Requires that the
@@ -98,8 +97,10 @@ computeWhileIters e = error $ "convertWhileIters: not a while-loop:\n" <> pretty
 -- where @n@ is an upper bound on the number of iterations of the
 -- while-loop. The resulting for-loop will execute for @n@ iterations on
 -- all inputs, so the tighter the bound the better.
-convertWhileLoop :: SubExp -> Exp SOACS -> ADM (Exp SOACS)
-convertWhileLoop bound_se (DoLoop val_pats (WhileLoop cond) body) =
+convertWhileLoop :: [SubExp] -> Exp SOACS -> ADM (Exp SOACS)
+convertWhileLoop (bound_se : []) loop@(DoLoop val_pats (WhileLoop _) _) =
+  convertWhileLoop (bound_se : map (Var . paramName . fst) val_pats) loop
+convertWhileLoop (bound_se : result_ses) (DoLoop val_pats (WhileLoop cond) body) =
   localScope (scopeOfFParams $ map fst val_pats) $ do
     i <- newVName "i"
     body' <-
@@ -107,10 +108,10 @@ convertWhileLoop bound_se (DoLoop val_pats (WhileLoop cond) body) =
         [ eIf
             (pure $ BasicOp $ SubExp $ Var cond)
             (pure body)
-            (resultBodyM $ map (Var . paramName . fst) val_pats)
+            (resultBodyM result_ses)
         ]
     pure $ DoLoop val_pats (ForLoop i Int64 bound_se mempty) body'
-convertWhileLoop _ e = error $ "convertWhileLoopBound: not a while-loop:\n" <> prettyString e
+convertWhileLoop _ e = error $ "convertWhileLoop: not a while-loop:\n" <> prettyString e
 
 -- | @nestifyLoop n bound loop@ transforms a loop into a depth-@n@ loop nest
 -- of @bound@-iteration loops. This transformation does not preserve
@@ -443,11 +444,11 @@ diffLoop diffStms pat aux loop m
        in case bounds of
             (bound : _) -> do
               let bound_se = Constant $ IntValue $ intValue Int64 bound
-              for_loop <- convertWhileLoop bound_se loop
+              for_loop <- convertWhileLoop [bound_se] loop
               diffLoop diffStms pat aux for_loop m
             _ -> do
-              bound <- computeWhileIters loop
-              for_loop <- convertWhileLoop bound =<< renameExp loop
+              bound_res <- computeWhileIters loop
+              for_loop <- convertWhileLoop bound_res =<< renameExp loop
               diffLoop diffStms pat aux for_loop m
   | otherwise = do
       fwdLoop pat aux loop
